@@ -9,6 +9,7 @@ import (
 
 	"github.com/davecgh/go-spew/spew"
 	"github.com/umbel/pilosa"
+	"fmt"
 )
 
 // SliceWidth is a helper reference to use when testing.
@@ -99,6 +100,37 @@ func TestFragment_Snapshot(t *testing.T) {
 	} else if n := f.Bitmap(1000).Count(); n != 1 {
 		t.Fatalf("unexpected count (reopen): %d", n)
 	}
+}
+
+// poo
+func TestFragment_maxBiclique(t *testing.T) {
+	f := MustOpenFragment("d", "f", 0)
+	defer f.Close()
+
+	// test data
+	for i := uint64(0); i < 10; i++ {
+		if i%2 == 0 {
+			f.MustSetBits(1, i)
+		}
+		if i%2 == 1 {
+			f.MustSetBits(2, i)
+		}
+		if i != 5 {
+			f.MustSetBits(3, i)
+		}
+	}
+
+	ret := f.MaxBiclique(3)
+	for _, bc := range ret {
+		if bc.Score > 0 {
+			fmt.Println("!!!!!!!!!!!!")
+			fmt.Println(bc)
+			fmt.Println("")
+		}
+	}
+	// fmt.Println("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@")
+	// spew.Dump(ret)
+
 }
 
 // Ensure a fragment can return the top n results.

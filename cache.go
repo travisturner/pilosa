@@ -229,6 +229,14 @@ func decodePair(pb *internal.Pair) Pair {
 	}
 }
 
+func decodeBiclique(pb *internal.Biclique) Biclique {
+	return Biclique{
+		Tiles: pb.GetTiles(),
+		Count: pb.GetCount(),
+		Score: pb.GetScore(),
+	}
+}
+
 type Bicliques []Biclique
 
 func (b Bicliques) Swap(i, j int)      { b[i], b[j] = b[j], b[i] }
@@ -241,6 +249,7 @@ func hash(s uint64) uint64 {
 	return uint64(h.Sum64())
 }
 
+// combine a list of tileIDs into a single identifier which order of tileIDS doesn't mater
 func makeLabel(ar []uint64) (r uint64) {
 	first := true
 	for _, b := range ar {
@@ -321,6 +330,13 @@ func decodePairs(a []*internal.Pair) []Pair {
 	other := make([]Pair, len(a))
 	for i := range a {
 		other[i] = decodePair(a[i])
+	}
+	return other
+}
+func decodeBicliques(a []*internal.Biclique) []Biclique {
+	other := make([]Biclique, len(a))
+	for i := range a {
+		other[i] = decodeBiclique(a[i])
 	}
 	return other
 }

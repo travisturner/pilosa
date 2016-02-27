@@ -69,8 +69,8 @@ func (p *Parser) parseCall() (Call, error) {
 		return p.parseUnionCall()
 	case "TopN":
 		return p.parseTopNCall()
-	case "Biclique":
-		return p.parseBicliqueCall()
+	case "Bicliques":
+		return p.parseBicliquesCall()
 	default:
 		return nil, &ParseError{Message: fmt.Sprintf("function not found: %s", lit), Pos: pos}
 	}
@@ -769,8 +769,8 @@ func decodeDate(v interface{}, target *time.Time) error {
 	return fmt.Errorf("invalid date value: %v", v)
 }
 
-func (p *Parser) parseBicliqueCall() (*Biclique, error) {
-	c := &Biclique{}
+func (p *Parser) parseBicliquesCall() (*Bicliques, error) {
+	c := &Bicliques{}
 	pos := p.pos()
 
 	// Scan opening parenthesis.

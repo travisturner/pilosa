@@ -398,19 +398,22 @@ func (f *Fragment) pos(bitmapID, profileID uint64) (uint64, error) {
 }
 
 type PairSlice []BitmapPair
+
 type Biclique struct {
 	Tiles []uint64
 	Count uint64 // number of profiles
 	Score uint64 // num tiles * Count
 }
 
-func (f *Fragment) MaxBiclique(n int) []Biclique{
+func (f *Fragment) MaxBiclique(n int) []Biclique {
 	f.mu.Lock()
+	f.cache.Invalidate()
 	pairs := f.cache.Top() // slice of bitmapPairs
 	f.mu.Unlock()
-	
-	topPairs := pairs[:n]
-	fmt.Println("Top Pairs: ", topPairs)
+	topPairs := pairs
+	if n < len(pairs) {
+		topPairs = pairs[:n]
+	}
 
 	return maxBiclique(topPairs)
 }
@@ -424,7 +427,7 @@ func maxBiclique(topPairs []BitmapPair) []Biclique {
 
 	results := make([]Biclique, 100)
 	i := 0
-	
+
 	for comb := range pairChan {
 		fmt.Println("Got a combination! ", comb)
 		// feed each to intersectPairs
@@ -447,21 +450,21 @@ func maxBiclique(topPairs []BitmapPair) []Biclique {
 
 func getTileIDs(pairs PairSlice) []uint64 {
 	tileIDs := make([]uint64, len(pairs))
-	for i:= 0; i < len(pairs); i++ {
+	for i := 0; i < len(pairs); i++ {
 		tileIDs[i] = pairs[i].ID
 	}
 	return tileIDs
 }
 
-func generateCombinations(pairs PairSlice, pairChan chan<-PairSlice) {
+func generateCombinations(pairs PairSlice, pairChan chan<- PairSlice) {
 	gcombs(pairs, pairChan)
 	close(pairChan)
 }
 
 func gcombs(pairs PairSlice, pairChan chan<- PairSlice) {
 	fmt.Println("gcombs, send to pairChan ", pairs)
-	
-	pairChan<- pairs
+
+	pairChan <- pairs
 	if len(pairs) == 1 {
 		return
 	}
@@ -473,7 +476,6 @@ func gcombs(pairs PairSlice, pairChan chan<- PairSlice) {
 		gcombs(ps, pairChan)
 	}
 }
-
 
 // intersectPairs generates a bitmap which represents all profiles which have all of the tiles in pairs
 func intersectPairs(pairs []BitmapPair) *Bitmap {

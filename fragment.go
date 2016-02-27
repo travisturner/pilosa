@@ -398,6 +398,7 @@ func (f *Fragment) pos(bitmapID, profileID uint64) (uint64, error) {
 }
 
 type PairSlice []BitmapPair
+
 type Biclique struct {
 	Tiles []uint64
 	Count uint64 // number of profiles
@@ -406,11 +407,13 @@ type Biclique struct {
 
 func (f *Fragment) MaxBiclique(n int) []Biclique {
 	f.mu.Lock()
+	f.cache.Invalidate()
 	pairs := f.cache.Top() // slice of bitmapPairs
 	f.mu.Unlock()
-
-	topPairs := pairs[:n]
-	fmt.Println("Top Pairs: ", topPairs)
+	topPairs := pairs
+	if n < len(pairs) {
+		topPairs = pairs[:n]
+	}
 
 	return maxBiclique(topPairs)
 }

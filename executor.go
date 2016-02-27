@@ -98,7 +98,7 @@ func (e *Executor) executeCall(db string, c pql.Call, slices []uint64, opt *Exec
 		return nil, e.executeSetProfileAttrs(db, c)
 	case *pql.TopN:
 		return e.executeTopN(db, c, slices, opt)
-	case *pql.Biclique:
+	case *pql.Bicliques:
 		return e.executeBiclique(db, c, slices, opt)
 	default:
 		panic("unreachable")
@@ -201,6 +201,7 @@ func (e *Executor) executeTopNSlices(db string, c *pql.TopN, slices []uint64, op
 			}
 			continue
 		}
+		//TODO fill in the missing pairs
 
 		// Otherwise execute remotely.
 		res, err := e.exec(node, db, &pql.Query{Calls: pql.Calls{c}}, nodeSlices, opt)
@@ -221,7 +222,7 @@ func (e *Executor) executeTopNSlices(db string, c *pql.TopN, slices []uint64, op
 	return results, nil
 }
 
-func (e *Executor) executeBiclique(db string, c *pql.Biclique, slices []uint64, opt *ExecOptions) ([]Biclique, error) {
+func (e *Executor) executeBiclique(db string, c *pql.Bicliques, slices []uint64, opt *ExecOptions) ([]Biclique, error) {
 	var results []Biclique
 	for node, nodeSlices := range e.slicesByNode(slices) {
 		// Execute locally if the hostname matches.
@@ -573,6 +574,8 @@ func (e *Executor) exec(node *Node, db string, q *pql.Query, slices []uint64, op
 			v, err = decodeBitmap(pb.Results[i].GetBitmap()), nil
 		case *pql.TopN:
 			v, err = decodePairs(pb.Results[i].GetPairs()), nil
+		case *pql.Bicliques:
+			return decodeBicliques(pb.Results[i].GetBicliques()), nil
 		case *pql.Count:
 			v, err = pb.Results[i].GetN(), nil
 		case *pql.SetBit:
@@ -619,13 +622,12 @@ func decodeError(s string) error {
 	return errors.New(s)
 }
 
-func (e *Executor) executeBicliqueSlice(db string, c *pql.Biclique, slice uint64) ([]Biclique, error) {
+func (e *Executor) executeBicliqueSlice(db string, c *pql.Bicliques, slice uint64) ([]Biclique, error) {
 	// Retrieve bitmap used to intersect.
 	frame := c.Frame
 	if frame == "" {
 		frame = DefaultFrame
 	}
-
 	f := e.Index().Fragment(db, frame, slice)
 	if f == nil {
 		return nil, nil

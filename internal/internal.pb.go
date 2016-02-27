@@ -12,6 +12,7 @@ It has these top-level messages:
 	Bitmap
 	Chunk
 	Pair
+	Biclique
 	Bit
 	Profile
 	Attr
@@ -101,6 +102,38 @@ func (m *Pair) GetKey() uint64 {
 func (m *Pair) GetCount() uint64 {
 	if m != nil && m.Count != nil {
 		return *m.Count
+	}
+	return 0
+}
+
+type Biclique struct {
+	Tiles            []uint64 `protobuf:"varint,1,rep,name=Tiles" json:"Tiles,omitempty"`
+	Count            *uint64  `protobuf:"varint,2,req,name=Count" json:"Count,omitempty"`
+	Score            *uint64  `protobuf:"varint,3,req,name=Score" json:"Score,omitempty"`
+	XXX_unrecognized []byte   `json:"-"`
+}
+
+func (m *Biclique) Reset()         { *m = Biclique{} }
+func (m *Biclique) String() string { return proto.CompactTextString(m) }
+func (*Biclique) ProtoMessage()    {}
+
+func (m *Biclique) GetTiles() []uint64 {
+	if m != nil {
+		return m.Tiles
+	}
+	return nil
+}
+
+func (m *Biclique) GetCount() uint64 {
+	if m != nil && m.Count != nil {
+		return *m.Count
+	}
+	return 0
+}
+
+func (m *Biclique) GetScore() uint64 {
+	if m != nil && m.Score != nil {
+		return *m.Score
 	}
 	return 0
 }
@@ -306,11 +339,12 @@ func (m *QueryResponse) GetProfiles() []*Profile {
 }
 
 type QueryResult struct {
-	Bitmap           *Bitmap `protobuf:"bytes,1,opt" json:"Bitmap,omitempty"`
-	N                *uint64 `protobuf:"varint,2,opt" json:"N,omitempty"`
-	Pairs            []*Pair `protobuf:"bytes,3,rep" json:"Pairs,omitempty"`
-	Changed          *bool   `protobuf:"varint,4,opt" json:"Changed,omitempty"`
-	XXX_unrecognized []byte  `json:"-"`
+	Bitmap           *Bitmap     `protobuf:"bytes,1,opt" json:"Bitmap,omitempty"`
+	N                *uint64     `protobuf:"varint,2,opt" json:"N,omitempty"`
+	Pairs            []*Pair     `protobuf:"bytes,3,rep" json:"Pairs,omitempty"`
+	Changed          *bool       `protobuf:"varint,4,opt" json:"Changed,omitempty"`
+	Bicliques        []*Biclique `protobuf:"bytes,7,rep,name=Bicliques" json:"Bicliques,omitempty"`
+	XXX_unrecognized []byte      `json:"-"`
 }
 
 func (m *QueryResult) Reset()         { *m = QueryResult{} }
@@ -343,6 +377,13 @@ func (m *QueryResult) GetChanged() bool {
 		return *m.Changed
 	}
 	return false
+}
+
+func (m *QueryResult) GetBicliques() []*Biclique {
+	if m != nil {
+		return m.Bicliques
+	}
+	return nil
 }
 
 type ImportRequest struct {

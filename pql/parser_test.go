@@ -349,3 +349,22 @@ func TestParser_Parse_Union(t *testing.T) {
 		t.Fatalf("unexpected query: %s", spew.Sdump(q))
 	}
 }
+
+// Ensure the parser can parse a "Bicliques()" function.
+func TestParser_Parse_Bicliques(t *testing.T) {
+	q, err := pql.ParseString(`Bicliques(frame=f,n=2)`)
+	if err != nil {
+		t.Fatal(err)
+	} else if !reflect.DeepEqual(q, &pql.Query{
+		Root: &pql.Bicliques{
+			Frame: "f",
+			N:     2,
+		},
+	}) {
+		t.Fatalf("unexpected query: %s", spew.Sdump(q))
+	}
+
+	if s := q.String(); s != `Bicliques(frame=f,n=2)` {
+		t.Fatalf("unexpected string encoding: %s", s)
+	}
+}

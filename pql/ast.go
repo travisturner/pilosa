@@ -40,7 +40,7 @@ func (*SetBitmapAttrs) node()  {}
 func (*SetProfileAttrs) node() {}
 func (*TopN) node()            {}
 func (*Union) node()           {}
-func (*Biclique) node()        {}
+func (*Bicliques) node()       {}
 
 // Call represents a function call in the AST.
 type Call interface {
@@ -60,7 +60,7 @@ func (*SetBitmapAttrs) call()  {}
 func (*SetProfileAttrs) call() {}
 func (*TopN) call()            {}
 func (*Union) call()           {}
-func (*Biclique) call()        {}
+func (*Bicliques) call()       {}
 
 // Calls represents a list of calls.
 type Calls []Call
@@ -356,17 +356,6 @@ func (c *TopN) String() string {
 	return fmt.Sprintf("TopN(%s)", strings.Join(args, ", "))
 }
 
-type Biclique struct {
-	Frame string
-	// Maximum number of results to return.
-	N int
-}
-
-// String returns the string representation of the call.
-func (c *Biclique) String() string {
-	return fmt.Sprintf("Biclique(%d)", c.N)
-}
-
 // Union represents a union() function call.
 type Union struct {
 	Inputs BitmapCalls
@@ -375,4 +364,15 @@ type Union struct {
 // String returns the string representation of the call.
 func (c *Union) String() string {
 	return fmt.Sprintf("Union(%s)", c.Inputs.String())
+}
+
+type Bicliques struct {
+	Frame string
+	// Maximum number of results to return.
+	N int
+}
+
+// String returns the string representation of the call.
+func (c *Bicliques) String() string {
+	return fmt.Sprintf("Bicliques(frame=%s,n=%d)", c.Frame, c.N)
 }

@@ -15,6 +15,12 @@ message Pair {
 	required uint64 Count = 2;
 }
 
+message Biclique {
+	repeated uint64 Tiles   = 1;
+	required uint64 Count = 2;
+	required uint64 Score = 3;
+}
+
 message Bit {
 	required uint64 BitmapID  = 1;
 	required uint64 ProfileID = 2;
@@ -57,6 +63,7 @@ message QueryResult {
 	optional uint64  N        = 2;
 	repeated Pair    Pairs    = 3;
 	optional bool    Changed  = 4;
+	repeated Biclique  Bicliques    = 5;
 }
 
 message ImportRequest {

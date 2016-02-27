@@ -405,11 +405,25 @@ type Biclique struct {
 	Score uint64 // num tiles * Count
 }
 
+type BCList []Biclique
+
+func (bcl BCList) Len() int {
+	return len(bcl)
+}
+func (bcl BCList) Less(i, j int) bool {
+	return bcl[i].Score > bcl[j].Score
+}
+
+func (bcl BCList) Swap(i, j int) {
+	bcl[i], bcl[j] = bcl[j], bcl[i]
+}
+
 func (f *Fragment) MaxBiclique(n int) []Biclique {
 	f.mu.Lock()
 	f.cache.Invalidate()
 	pairs := f.cache.Top() // slice of bitmapPairs
 	f.mu.Unlock()
+
 	topPairs := pairs
 	if n < len(pairs) {
 		topPairs = pairs[:n]
@@ -465,6 +479,7 @@ func gcombs(pairs PairSlice, pairChan chan<- PairSlice) {
 	fmt.Println("gcombs, send to pairChan ", pairs)
 
 	pairChan <- pairs
+
 	if len(pairs) == 1 {
 		return
 	}

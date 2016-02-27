@@ -1,6 +1,7 @@
 package pilosa
 
 import (
+	"hash/fnv"
 	"io"
 	"sort"
 	"time"
@@ -226,6 +227,59 @@ func decodePair(pb *internal.Pair) Pair {
 		Key:   pb.GetKey(),
 		Count: pb.GetCount(),
 	}
+}
+
+type Bicliques []Biclique
+
+func (b Bicliques) Swap(i, j int)      { b[i], b[j] = b[j], b[i] }
+func (b Bicliques) Len() int           { return len(b) }
+func (b Bicliques) Less(i, j int) bool { return b[i].Score > b[j].Score }
+
+func hash(s uint64) uint64 {
+	h := fnv.New64a()
+	h.Write([]byte(string(s)))
+	return uint64(h.Sum64())
+}
+
+func makeLabel(ar []uint64) (r uint64) {
+	first := true
+	for _, b := range ar {
+		v := uint64(hash(b))
+		if first {
+			r = v
+			first = false
+		} else {
+			r = v ^ r
+		}
+	}
+	return
+}
+func (p Bicliques) Add(other []Biclique) []Biclique {
+
+	m := make(map[uint64]Biclique, len(p))
+	for _, pair := range p {
+		label := makeLabel(pair.Tiles)
+		m[label] = pair
+	}
+	// Add/merge from other.
+	for _, pair := range other {
+
+		label := makeLabel(pair.Tiles)
+		o, found := m[label]
+		if found {
+			o.Score += uint64(len(pair.Tiles)) * (o.Count * pair.Count)
+			m[label] = o
+		} else {
+			m[label] = pair
+		}
+	}
+
+	// Convert back to slice.
+	a := make([]Biclique, len(m), len(m))
+	for _, v := range m {
+		a = append(a, v)
+	}
+	return a
 }
 
 type Pairs []Pair

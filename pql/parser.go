@@ -79,10 +79,12 @@ func (p *Parser) parseCall() (Call, error) {
 		return p.parseSetBitmapAttrsCall()
 	case "SetProfileAttrs":
 		return p.parseSetProfileAttrsCall()
-	case "TopN":
-		return p.parseTopNCall()
 	case "Union":
 		return p.parseUnionCall()
+	case "TopN":
+		return p.parseTopNCall()
+	case "Biclique":
+		return p.parseBicliqueCall()
 	default:
 		return nil, &ParseError{Message: fmt.Sprintf("function not found: %s", lit), Pos: pos}
 	}
@@ -807,4 +809,36 @@ func decodeDate(v interface{}, target *time.Time) error {
 		return nil
 	}
 	return fmt.Errorf("invalid date value: %v", v)
+}
+
+func (p *Parser) parseBicliqueCall() (*Biclique, error) {
+	c := &Biclique{}
+	pos := p.pos()
+
+	// Scan opening parenthesis.
+	if err := p.expect(LPAREN); err != nil {
+		return nil, err
+	}
+
+	// Parse arguments.
+	args, err := p.parseArgs()
+	if err != nil {
+		return nil, err
+	}
+
+	// Copy arguments to AST.
+	for _, arg := range args {
+		switch arg.key {
+		case 0, "frame":
+			if err := decodeString(arg.value, &c.Frame); err != nil {
+				return nil, parseErrorf(pos, "frame: %s", err)
+			}
+		case 1, "n":
+			if err := decodeInt(arg.value, &c.N); err != nil {
+				return nil, parseErrorf(pos, "n: %s", err)
+			}
+		}
+
+	}
+	return c, nil
 }

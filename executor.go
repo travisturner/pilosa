@@ -90,6 +90,8 @@ func (e *Executor) executeCall(db string, c pql.Call, slices []uint64, opt *Exec
 		return e.executeProfile(db, c, opt)
 	case *pql.TopN:
 		return e.executeTopN(db, c, slices, opt)
+	case *pql.Biclique:
+		return e.executeBiclique(db, c, slices, opt)
 	default:
 		panic("unreachable")
 	}
@@ -178,6 +180,40 @@ func (e *Executor) executeTopN(db string, c *pql.TopN, slices []uint64, opt *Exe
 
 	// Sort final merged results.
 	sort.Sort(Pairs(results))
+
+	// Only keep the top n after sorting.
+	if len(results) > c.N {
+		results = results[0:c.N]
+	}
+
+	return results, nil
+}
+
+func (e *Executor) executeBiclique(db string, c *pql.Biclique, slices []uint64, opt *ExecOptions) ([]Biclique, error) {
+	var results []Biclique
+	for node, nodeSlices := range e.slicesByNode(slices) {
+		// Execute locally if the hostname matches.
+		if node.Host == e.Host {
+			for _, slice := range nodeSlices {
+				bc, err := e.executeBicliqueSlice(db, c, slice)
+				if err != nil {
+					return nil, err
+				}
+				results = Bicliques(results).Add(bc)
+			}
+			continue
+		}
+
+		// Otherwise execute remotely.
+		res, err := e.exec(node, db, &pql.Query{Root: c}, nodeSlices, opt)
+		if err != nil {
+			return nil, err
+		}
+		results = Bicliques(results).Add(res.([]Biclique))
+	}
+
+	// Sort final merged results.
+	sort.Sort(Bicliques(results))
 
 	// Only keep the top n after sorting.
 	if len(results) > c.N {
@@ -498,4 +534,19 @@ func decodeError(s string) error {
 		return nil
 	}
 	return errors.New(s)
+}
+
+func (e *Executor) executeBicliqueSlice(db string, c *pql.Biclique, slice uint64) ([]Biclique, error) {
+	// Retrieve bitmap used to intersect.
+	frame := c.Frame
+	if frame == "" {
+		frame = DefaultFrame
+	}
+
+	f := e.Index().Fragment(db, frame, slice)
+	if f == nil {
+		return nil, nil
+	}
+
+	return f.MaxBiclique(c.N), nil
 }

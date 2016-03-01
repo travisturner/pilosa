@@ -7,9 +7,12 @@ import (
 	"reflect"
 	"testing"
 
+	"fmt"
+	"math/rand"
+	"sort"
+
 	"github.com/davecgh/go-spew/spew"
 	"github.com/umbel/pilosa"
-	"fmt"
 )
 
 // SliceWidth is a helper reference to use when testing.
@@ -102,7 +105,7 @@ func TestFragment_Snapshot(t *testing.T) {
 	}
 }
 
-// poo
+// Test biclique junk
 func TestFragment_maxBiclique(t *testing.T) {
 	f := MustOpenFragment("d", "f", 0)
 	defer f.Close()
@@ -118,16 +121,24 @@ func TestFragment_maxBiclique(t *testing.T) {
 		if i != 5 {
 			f.MustSetBits(3, i)
 		}
+		f.MustSetBits(uint64(rand.Intn(8)), i)
+		f.MustSetBits(uint64(rand.Intn(8)), i)
+		f.MustSetBits(uint64(rand.Intn(8)), i)
+		f.MustSetBits(uint64(rand.Intn(8)), i)
+		f.MustSetBits(uint64(rand.Intn(8)), i)
+		f.MustSetBits(uint64(rand.Intn(8)), i)
 	}
 
-	ret := f.MaxBiclique(3)
-	for _, bc := range ret {
-		if bc.Score > 0 {
-			fmt.Println("!!!!!!!!!!!!")
-			fmt.Println(bc)
-			fmt.Println("")
+	ret := pilosa.BCList(f.MaxBiclique(3))
+	sort.Sort(ret)
+	fmt.Println("SWEET HOT RESULTS BELOW!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+	for i := 0; i < len(ret); i++ {
+		fmt.Println(ret[i])
+		if i > 5 {
+			break
 		}
 	}
+	fmt.Println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!END SWEET HOT RESULTS")
 	// fmt.Println("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@")
 	// spew.Dump(ret)
 

@@ -557,6 +557,10 @@ func encodeQueryResponse(resp *QueryResponse) *internal.QueryResponse {
 			pb.Results[i].N = proto.Uint64(result)
 		case bool:
 			pb.Results[i].Changed = proto.Bool(result)
+		case []Biclique:
+			pb.Results[i].Bicliques = encodeBicliques(result)
+		default:
+			panic(fmt.Sprintf("invalid query result type: %T", resp.Results))
 		}
 	}
 

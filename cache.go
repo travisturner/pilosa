@@ -229,6 +229,14 @@ func decodePair(pb *internal.Pair) Pair {
 	}
 }
 
+func encodeBiclique(p Biclique) *internal.Biclique {
+	return &internal.Biclique{
+		Tiles: p.Tiles,
+		Count: proto.Uint64(p.Count),
+		Score: proto.Uint64(p.Score),
+	}
+}
+
 func decodeBiclique(pb *internal.Biclique) Biclique {
 	return Biclique{
 		Tiles: pb.GetTiles(),
@@ -333,10 +341,19 @@ func decodePairs(a []*internal.Pair) []Pair {
 	}
 	return other
 }
+
 func decodeBicliques(a []*internal.Biclique) []Biclique {
 	other := make([]Biclique, len(a))
 	for i := range a {
 		other[i] = decodeBiclique(a[i])
+	}
+	return other
+}
+
+func encodeBicliques(a []Biclique) []*internal.Biclique {
+	other := make([]*internal.Biclique, len(a))
+	for i := range a {
+		other[i] = encodeBiclique(a[i])
 	}
 	return other
 }

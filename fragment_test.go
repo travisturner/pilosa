@@ -7,11 +7,12 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/davecgh/go-spew/spew"
-	"github.com/umbel/pilosa"
 	"fmt"
 	"math/rand"
 	"sort"
+
+	"github.com/davecgh/go-spew/spew"
+	"github.com/umbel/pilosa"
 )
 
 // SliceWidth is a helper reference to use when testing.
@@ -131,8 +132,11 @@ func TestFragment_maxBiclique(t *testing.T) {
 	ret := pilosa.BCList(f.MaxBiclique(3))
 	sort.Sort(ret)
 	fmt.Println("SWEET HOT RESULTS BELOW!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-	for i:=0; i<5; i++ {
+	for i := 0; i < len(ret); i++ {
 		fmt.Println(ret[i])
+		if i > 5 {
+			break
+		}
 	}
 	fmt.Println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!END SWEET HOT RESULTS")
 	// fmt.Println("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@")

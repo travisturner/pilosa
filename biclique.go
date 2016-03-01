@@ -32,7 +32,25 @@ func (f *Fragment) MaxBiclique(n int) []Biclique {
 		topPairs = pairs[:n]
 	}
 
-	return maxBiclique(topPairs)
+	results := make(chan []BitmapPair, 100)
+	go func() {
+		bicliqueFind(topPairs, nil, []BitmapPair{}, topPairs, []BitmapPair{}, results)
+		close(results)
+	}()
+
+	// read results and build []Biclique
+	bicliques := []Biclique{}
+	for bmPairs := range results {
+		tiles := getTileIDs(bmPairs)
+		bicliqueBitmap := intersectPairs(bmPairs)
+		bicliques = append(bicliques,
+			Biclique{
+				Tiles: tiles,
+				Count: bicliqueBitmap.Count(),
+				Score: uint64(len(tiles)) * bicliqueBitmap.Count(),
+			})
+	}
+	return bicliques
 }
 
 func maxBiclique(topPairs []BitmapPair) []Biclique {
@@ -65,9 +83,9 @@ func maxBiclique(topPairs []BitmapPair) []Biclique {
 	return results
 }
 
-func bicliqueFind(G []BitmapPair, L *Bitmap, R []BitmapPair, P []BitmapPair, Q []BitmapPair, results chan *Bitmap) {
+func bicliqueFind(G []BitmapPair, L *Bitmap, R []BitmapPair, P []BitmapPair, Q []BitmapPair, results chan []BitmapPair) {
 	// G is topPairs
-	// L should start with all bits set (L == U)
+	// L should start with all bits set (L == U) (it will actually start nil, and we'll special case it below)
 	// R starts empty
 	// P starts as topPairs (all tiles are candidates)
 	// Q starts empty
@@ -81,7 +99,12 @@ func bicliqueFind(G []BitmapPair, L *Bitmap, R []BitmapPair, P []BitmapPair, Q [
 		newR := append(R, x)
 
 		//  L' ← {u ∈ L | (u, x) ∈ E(G)};
-		newL := L.Clone()
+		var newL *Bitmap
+		if L == nil {
+			newL = x.Bitmap.Clone()
+		} else {
+			newL = L.Clone()
+		}
 		newL = newL.Intersect(x.Bitmap)
 		newLcnt := newL.BitCount()
 
@@ -117,8 +140,8 @@ func bicliqueFind(G []BitmapPair, L *Bitmap, R []BitmapPair, P []BitmapPair, Q [
 					newP = append(newP, v)
 				}
 			}
-			// report newR as maximal bicliqued
-			results <- newL
+			// report newR as maximal biclique
+			results <- newR
 			if len(newP) > 0 {
 				bicliqueFind(G, newL, newR, newP, newQ, results)
 			}

@@ -356,9 +356,11 @@ func TestParser_Parse_Bicliques(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	} else if !reflect.DeepEqual(q, &pql.Query{
-		Root: &pql.Bicliques{
-			Frame: "f",
-			N:     2,
+		Calls: pql.Calls{
+			&pql.Bicliques{
+				Frame: "f",
+				N:     2,
+			},
 		},
 	}) {
 		t.Fatalf("unexpected query: %s", spew.Sdump(q))

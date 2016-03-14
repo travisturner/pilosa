@@ -30,17 +30,31 @@ func ParseString(s string) (*Query, error) {
 
 // Parse parses the next node in the query.
 func (p *Parser) Parse() (*Query, error) {
-	fn, err := p.parseCall()
-	if err != nil {
-		return nil, err
+	q := &Query{}
+	for {
+		call, err := p.parseCall()
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			return nil, err
+		}
+		q.Calls = append(q.Calls, call)
 	}
-	return &Query{Root: fn}, nil
+
+	// Require at least one call.
+	if len(q.Calls) == 0 {
+		return nil, io.ErrUnexpectedEOF
+	}
+
+	return q, nil
 }
 
 // parseCall parses the next function call.
 func (p *Parser) parseCall() (Call, error) {
 	tok, pos, lit := p.scanIgnoreWhitespace()
-	if tok != IDENT {
+	if tok == EOF {
+		return nil, io.EOF
+	} else if tok != IDENT {
 		return nil, &ParseError{Message: fmt.Sprintf("expected identifier, found: %s", lit), Pos: pos}
 	}
 
@@ -475,9 +489,13 @@ func (p *Parser) parseTopNCall() (*TopN, error) {
 			c.Src = v
 			continue
 		}
+
+		// Assign filter values if there's only a value and no named key.
 		if v, ok := arg.value.([]interface{}); ok {
-			c.Filters = v
-			continue
+			if _, ok := arg.key.(string); !ok {
+				c.Filters = v
+				continue
+			}
 		}
 
 		switch arg.key {
@@ -491,6 +509,10 @@ func (p *Parser) parseTopNCall() (*TopN, error) {
 			}
 		case 2, "field":
 			if err := decodeString(arg.value, &c.Field); err != nil {
+				return nil, parseErrorf(pos, "n: %s", err)
+			}
+		case "ids":
+			if err := decodeUint64Slice(arg.value, &c.BitmapIDs); err != nil {
 				return nil, parseErrorf(pos, "n: %s", err)
 			}
 		default:
@@ -745,6 +767,26 @@ func decodeUint64(v interface{}, target *uint64) error {
 		return nil
 	}
 	return fmt.Errorf("invalid int value: %v", v)
+}
+
+// decodeUint64Slice type converts v to target.
+func decodeUint64Slice(v interface{}, target *[]uint64) error {
+	input, ok := v.([]interface{})
+	if !ok {
+		return fmt.Errorf("invalid array value: %v", v)
+	}
+
+	a := make([]uint64, len(input))
+	for i := range input {
+		elem, ok := input[i].(uint64)
+		if !ok {
+			return fmt.Errorf("invalid int element: %v", input[i])
+		}
+		a[i] = elem
+	}
+
+	*target = a
+	return nil
 }
 
 // decodeString type converts v to target.

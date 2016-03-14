@@ -24,13 +24,13 @@ func TestExecutor_Execute_Bitmap(t *testing.T) {
 	e := NewExecutor(idx.Index, NewCluster(1))
 	if res, err := e.Execute("d", MustParse(`Bitmap(id=10, frame=f)`), nil, nil); err != nil {
 		t.Fatal(err)
-	} else if chunks := res.(*pilosa.Bitmap).Chunks(); len(chunks) != 2 {
+	} else if chunks := res[0].(*pilosa.Bitmap).Chunks(); len(chunks) != 2 {
 		t.Fatalf("unexpected chunk length: %s", spew.Sdump(chunks))
 	} else if chunks[0].Value[0] != 8 {
 		t.Fatalf("unexpected chunk(0): %s", spew.Sdump(chunks[0]))
 	} else if chunks[1].Value[0] != 2 {
 		t.Fatalf("unexpected chunk(1): %s", spew.Sdump(chunks[1]))
-	} else if attrs := res.(*pilosa.Bitmap).Attrs; !reflect.DeepEqual(attrs, map[string]interface{}{"foo": "bar", "baz": uint64(123)}) {
+	} else if attrs := res[0].(*pilosa.Bitmap).Attrs; !reflect.DeepEqual(attrs, map[string]interface{}{"foo": "bar", "baz": uint64(123)}) {
 		t.Fatalf("unexpected attrs: %s", spew.Sdump(attrs))
 	}
 }
@@ -47,7 +47,7 @@ func TestExecutor_Execute_Difference(t *testing.T) {
 	e := NewExecutor(idx.Index, NewCluster(1))
 	if res, err := e.Execute("d", MustParse(`Difference(Bitmap(id=10), Bitmap(id=11))`), nil, nil); err != nil {
 		t.Fatal(err)
-	} else if chunks := res.(*pilosa.Bitmap).Chunks(); len(chunks) != 1 {
+	} else if chunks := res[0].(*pilosa.Bitmap).Chunks(); len(chunks) != 1 {
 		t.Fatalf("unexpected chunk length: %s", spew.Sdump(chunks))
 	} else if chunks[0].Value[0] != 10 { // b1010
 		t.Fatalf("unexpected chunk(0): %s", spew.Sdump(chunks[0]))
@@ -69,7 +69,7 @@ func TestExecutor_Execute_Intersect(t *testing.T) {
 	e := NewExecutor(idx.Index, NewCluster(1))
 	if res, err := e.Execute("d", MustParse(`Intersect(Bitmap(id=10), Bitmap(id=11))`), nil, nil); err != nil {
 		t.Fatal(err)
-	} else if chunks := res.(*pilosa.Bitmap).Chunks(); len(chunks) != 2 {
+	} else if chunks := res[0].(*pilosa.Bitmap).Chunks(); len(chunks) != 2 {
 		t.Fatalf("unexpected chunk length: %s", spew.Sdump(chunks))
 	} else if chunks[0].Value[0] != 2 {
 		t.Fatalf("unexpected chunk(0): %s", spew.Sdump(chunks[0]))
@@ -92,7 +92,7 @@ func TestExecutor_Execute_Union(t *testing.T) {
 	e := NewExecutor(idx.Index, NewCluster(1))
 	if res, err := e.Execute("d", MustParse(`Union(Bitmap(id=10), Bitmap(id=11))`), nil, nil); err != nil {
 		t.Fatal(err)
-	} else if chunks := res.(*pilosa.Bitmap).Chunks(); len(chunks) != 2 {
+	} else if chunks := res[0].(*pilosa.Bitmap).Chunks(); len(chunks) != 2 {
 		t.Fatalf("unexpected chunk length: %s", spew.Sdump(chunks))
 	} else if chunks[0].Value[0] != 5 {
 		t.Fatalf("unexpected chunk(0): %s", spew.Sdump(chunks[0]))
@@ -110,10 +110,10 @@ func TestExecutor_Execute_Count(t *testing.T) {
 	idx.MustCreateFragmentIfNotExists("d", "f", 1).MustSetBits(10, SliceWidth+2)
 
 	e := NewExecutor(idx.Index, NewCluster(1))
-	if n, err := e.Execute("d", MustParse(`Count(Bitmap(id=10, frame=f))`), nil, nil); err != nil {
+	if res, err := e.Execute("d", MustParse(`Count(Bitmap(id=10, frame=f))`), nil, nil); err != nil {
 		t.Fatal(err)
-	} else if n != uint64(3) {
-		t.Fatalf("unexpected n: %d", n)
+	} else if res[0] != uint64(3) {
+		t.Fatalf("unexpected n: %d", res[0])
 	}
 }
 
@@ -131,7 +131,7 @@ func TestExecutor_Execute_SetBit(t *testing.T) {
 	if res, err := e.Execute("d", MustParse(`SetBit(id=11, frame=f, profileID=1)`), nil, nil); err != nil {
 		t.Fatal(err)
 	} else {
-		if !res.(bool) {
+		if !res[0].(bool) {
 			t.Fatalf("expected bit changed")
 		}
 	}
@@ -142,7 +142,7 @@ func TestExecutor_Execute_SetBit(t *testing.T) {
 	if res, err := e.Execute("d", MustParse(`SetBit(id=11, frame=f, profileID=1)`), nil, nil); err != nil {
 		t.Fatal(err)
 	} else {
-		if res.(bool) {
+		if res[0].(bool) {
 			t.Fatalf("expected bit unchanged")
 		}
 	}
@@ -196,7 +196,7 @@ func TestExecutor_Execute_Biclique(t *testing.T) {
 	e := NewExecutor(idx.Index, NewCluster(1))
 	if result, err := e.Execute("d", MustParse(`Bicliques(frame=f, n=2)`), nil, nil); err != nil {
 		t.Fatal(err)
-	} else if !reflect.DeepEqual(result, []pilosa.Biclique{
+	} else if !reflect.DeepEqual(result[0], []pilosa.Biclique{
 		{Tiles: []uint64{3, 1}, Count: 5, Score: 10},
 		{Tiles: []uint64{3}, Count: 9, Score: 9},
 	}) {
@@ -221,7 +221,7 @@ func TestExecutor_Execute_TopN_fill(t *testing.T) {
 	e := NewExecutor(idx.Index, NewCluster(1))
 	if result, err := e.Execute("d", MustParse(`TopN(frame=f, n=1)`), nil, nil); err != nil {
 		t.Fatal(err)
-	} else if !reflect.DeepEqual(result, []pilosa.Pair{
+	} else if !reflect.DeepEqual(result[0], []pilosa.Pair{
 		{Key: 0, Count: 4},
 	}) {
 		t.Fatalf("unexpected result: %s", spew.Sdump(result))
@@ -246,7 +246,7 @@ func TestExecutor_Execute_TopN(t *testing.T) {
 	e := NewExecutor(idx.Index, NewCluster(1))
 	if result, err := e.Execute("d", MustParse(`TopN(frame=f, n=2)`), nil, nil); err != nil {
 		t.Fatal(err)
-	} else if !reflect.DeepEqual(result, []pilosa.Pair{
+	} else if !reflect.DeepEqual(result[0], []pilosa.Pair{
 		{Key: 0, Count: 5},
 		{Key: 10, Count: 2},
 	}) {
@@ -278,11 +278,11 @@ func TestExecutor_Execute_TopN_Src(t *testing.T) {
 	e := NewExecutor(idx.Index, NewCluster(1))
 	if result, err := e.Execute("d", MustParse(`TopN(Bitmap(id=100, frame=other), frame=f, n=3)`), nil, nil); err != nil {
 		t.Fatal(err)
-	} else if !reflect.DeepEqual(result, []pilosa.Pair{
+	} else if !reflect.DeepEqual(result, []interface{}{[]pilosa.Pair{
 		{Key: 20, Count: 3},
 		{Key: 10, Count: 2},
 		{Key: 0, Count: 1},
-	}) {
+	}}) {
 		t.Fatalf("unexpected result: %s", spew.Sdump(result))
 	}
 }
@@ -300,7 +300,7 @@ func TestExecutor_Execute_Range(t *testing.T) {
 	e := NewExecutor(idx.Index, NewCluster(1))
 	if res, err := e.Execute("d", MustParse(`Range(id=1, frame=f.t, start="2000-01-01T00:00", end="2000-01-01T01:00")`), nil, nil); err != nil {
 		t.Fatal(err)
-	} else if bits := res.(*pilosa.Bitmap).Bits(); !reflect.DeepEqual(bits, []uint64{100}) {
+	} else if bits := res[0].(*pilosa.Bitmap).Bits(); !reflect.DeepEqual(bits, []uint64{100}) {
 		t.Fatalf("unexpected bits: %+v", bits)
 	}
 }
@@ -315,7 +315,7 @@ func TestExecutor_Execute_Remote_Bitmap(t *testing.T) {
 	c.Nodes[1].Host = s.Host()
 
 	// Mock secondary server's executor to verify arguments and return a bitmap.
-	s.Handler.Executor.ExecuteFn = func(db string, query *pql.Query, slices []uint64, opt *pilosa.ExecOptions) (interface{}, error) {
+	s.Handler.Executor.ExecuteFn = func(db string, query *pql.Query, slices []uint64, opt *pilosa.ExecOptions) ([]interface{}, error) {
 		if db != `d` {
 			t.Fatalf("unexpected db: %s", db)
 		} else if query.String() != `Bitmap(id=10, frame=f)` {
@@ -330,7 +330,7 @@ func TestExecutor_Execute_Remote_Bitmap(t *testing.T) {
 			(0*SliceWidth)+2,
 			(2*SliceWidth)+4,
 		)
-		return bm, nil
+		return []interface{}{bm}, nil
 	}
 
 	// Create local executor data.
@@ -342,7 +342,7 @@ func TestExecutor_Execute_Remote_Bitmap(t *testing.T) {
 	e := NewExecutor(idx.Index, c)
 	if res, err := e.Execute("d", MustParse(`Bitmap(id=10, frame=f)`), nil, nil); err != nil {
 		t.Fatal(err)
-	} else if chunks := res.(*pilosa.Bitmap).Chunks(); len(chunks) != 3 {
+	} else if chunks := res[0].(*pilosa.Bitmap).Chunks(); len(chunks) != 3 {
 		t.Fatalf("unexpected chunk length: %s", spew.Sdump(chunks))
 	} else if chunks[0].Value[0] != 6 {
 		t.Fatalf("unexpected chunk(0): %s", spew.Sdump(chunks[0]))
@@ -361,8 +361,8 @@ func TestExecutor_Execute_Remote_Count(t *testing.T) {
 	c.Nodes[1].Host = s.Host()
 
 	// Mock secondary server's executor to return a count.
-	s.Handler.Executor.ExecuteFn = func(db string, query *pql.Query, slices []uint64, opt *pilosa.ExecOptions) (interface{}, error) {
-		return uint64(10), nil
+	s.Handler.Executor.ExecuteFn = func(db string, query *pql.Query, slices []uint64, opt *pilosa.ExecOptions) ([]interface{}, error) {
+		return []interface{}{uint64(10)}, nil
 	}
 
 	// Create local executor data. The local node owns slice 1.
@@ -372,10 +372,10 @@ func TestExecutor_Execute_Remote_Count(t *testing.T) {
 	idx.MustCreateFragmentIfNotExists("d", "f", 1).MustSetBits(10, (1*SliceWidth)+2)
 
 	e := NewExecutor(idx.Index, c)
-	if n, err := e.Execute("d", MustParse(`Count(Bitmap(id=10, frame=f))`), nil, nil); err != nil {
+	if res, err := e.Execute("d", MustParse(`Count(Bitmap(id=10, frame=f))`), nil, nil); err != nil {
 		t.Fatal(err)
-	} else if n != uint64(12) {
-		t.Fatalf("unexpected n: %d", n)
+	} else if res[0] != uint64(12) {
+		t.Fatalf("unexpected n: %d", res[0])
 	}
 }
 
@@ -391,14 +391,14 @@ func TestExecutor_Execute_Remote_SetBit(t *testing.T) {
 
 	// Mock secondary server's executor to verify arguments.
 	var remoteCalled bool
-	s.Handler.Executor.ExecuteFn = func(db string, query *pql.Query, slices []uint64, opt *pilosa.ExecOptions) (interface{}, error) {
+	s.Handler.Executor.ExecuteFn = func(db string, query *pql.Query, slices []uint64, opt *pilosa.ExecOptions) ([]interface{}, error) {
 		if db != `d` {
 			t.Fatalf("unexpected db: %s", db)
 		} else if query.String() != `SetBit(id=10, frame=f, profileID=2)` {
 			t.Fatalf("unexpected query: %s", query.String())
 		}
 		remoteCalled = true
-		return nil, nil
+		return []interface{}{nil}, nil
 	}
 
 	// Create local executor data.
@@ -429,21 +429,36 @@ func TestExecutor_Execute_Remote_TopN(t *testing.T) {
 	c.Nodes[1].Host = s.Host()
 
 	// Mock secondary server's executor to verify arguments and return a bitmap.
-	s.Handler.Executor.ExecuteFn = func(db string, query *pql.Query, slices []uint64, opt *pilosa.ExecOptions) (interface{}, error) {
+	var remoteExecN int
+	s.Handler.Executor.ExecuteFn = func(db string, query *pql.Query, slices []uint64, opt *pilosa.ExecOptions) ([]interface{}, error) {
 		if db != `d` {
 			t.Fatalf("unexpected db: %s", db)
-		} else if query.String() != `TopN(frame=f, n=3)` {
-			t.Fatalf("unexpected query: %s", query.String())
 		} else if !reflect.DeepEqual(slices, []uint64{0, 2, 4, 6}) {
 			t.Fatalf("unexpected slices: %+v", slices)
 		}
 
+		// Query should be executed twice. Once to get the top bitmaps for the
+		// slices and a second time to get the counts for a set of bitmaps.
+		switch remoteExecN {
+		case 0:
+			if query.String() != `TopN(frame=f, n=3)` {
+				t.Fatalf("unexpected query(0): %s", query.String())
+			}
+		case 1:
+			if query.String() != `TopN(frame=f, ids=[0,10,30])` {
+				t.Fatalf("unexpected query(1): %s", query.String())
+			}
+		default:
+			t.Fatalf("too many remote exec calls")
+		}
+		remoteExecN++
+
 		// Return pair counts.
-		return []pilosa.Pair{
+		return []interface{}{[]pilosa.Pair{
 			{Key: 0, Count: 5},
 			{Key: 10, Count: 2},
 			{Key: 30, Count: 2},
-		}, nil
+		}}, nil
 	}
 
 	// Create local executor data on slice 1 & 3.
@@ -455,11 +470,11 @@ func TestExecutor_Execute_Remote_TopN(t *testing.T) {
 	e := NewExecutor(idx.Index, c)
 	if res, err := e.Execute("d", MustParse(`TopN(frame=f, n=3)`), nil, nil); err != nil {
 		t.Fatal(err)
-	} else if !reflect.DeepEqual(res, []pilosa.Pair{
+	} else if !reflect.DeepEqual(res, []interface{}{[]pilosa.Pair{
 		{Key: 0, Count: 5},
 		{Key: 30, Count: 4},
 		{Key: 10, Count: 2},
-	}) {
+	}}) {
 		t.Fatalf("unexpected results: %s", spew.Sdump(res))
 	}
 }

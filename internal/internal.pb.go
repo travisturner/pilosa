@@ -19,6 +19,7 @@ It has these top-level messages:
 	AttrMap
 	QueryRequest
 	QueryResponse
+	QueryResult
 	ImportRequest
 	ImportResponse
 	Cache
@@ -250,6 +251,7 @@ type QueryRequest struct {
 	Profiles         *bool    `protobuf:"varint,4,opt,name=Profiles" json:"Profiles,omitempty"`
 	Timestamp        *int64   `protobuf:"varint,5,opt,name=Timestamp" json:"Timestamp,omitempty"`
 	Quantum          *uint32  `protobuf:"varint,6,opt,name=Quantum" json:"Quantum,omitempty"`
+	Remote           *bool    `protobuf:"varint,7,opt,name=Remote" json:"Remote,omitempty"`
 	XXX_unrecognized []byte   `json:"-"`
 }
 
@@ -299,15 +301,18 @@ func (m *QueryRequest) GetQuantum() uint32 {
 	return 0
 }
 
+func (m *QueryRequest) GetRemote() bool {
+	if m != nil && m.Remote != nil {
+		return *m.Remote
+	}
+	return false
+}
+
 type QueryResponse struct {
-	Err              *string     `protobuf:"bytes,1,opt,name=Err" json:"Err,omitempty"`
-	Bitmap           *Bitmap     `protobuf:"bytes,2,opt,name=Bitmap" json:"Bitmap,omitempty"`
-	N                *uint64     `protobuf:"varint,3,opt,name=N" json:"N,omitempty"`
-	Pairs            []*Pair     `protobuf:"bytes,4,rep,name=Pairs" json:"Pairs,omitempty"`
-	Profiles         []*Profile  `protobuf:"bytes,5,rep,name=Profiles" json:"Profiles,omitempty"`
-	Changed          *bool       `protobuf:"varint,6,opt,name=Changed" json:"Changed,omitempty"`
-	Bicliques        []*Biclique `protobuf:"bytes,7,rep,name=Bicliques" json:"Bicliques,omitempty"`
-	XXX_unrecognized []byte      `json:"-"`
+	Err              *string        `protobuf:"bytes,1,opt,name=Err" json:"Err,omitempty"`
+	Results          []*QueryResult `protobuf:"bytes,2,rep,name=Results" json:"Results,omitempty"`
+	Profiles         []*Profile     `protobuf:"bytes,3,rep,name=Profiles" json:"Profiles,omitempty"`
+	XXX_unrecognized []byte         `json:"-"`
 }
 
 func (m *QueryResponse) Reset()         { *m = QueryResponse{} }
@@ -321,23 +326,9 @@ func (m *QueryResponse) GetErr() string {
 	return ""
 }
 
-func (m *QueryResponse) GetBitmap() *Bitmap {
+func (m *QueryResponse) GetResults() []*QueryResult {
 	if m != nil {
-		return m.Bitmap
-	}
-	return nil
-}
-
-func (m *QueryResponse) GetN() uint64 {
-	if m != nil && m.N != nil {
-		return *m.N
-	}
-	return 0
-}
-
-func (m *QueryResponse) GetPairs() []*Pair {
-	if m != nil {
-		return m.Pairs
+		return m.Results
 	}
 	return nil
 }
@@ -349,14 +340,48 @@ func (m *QueryResponse) GetProfiles() []*Profile {
 	return nil
 }
 
-func (m *QueryResponse) GetChanged() bool {
+type QueryResult struct {
+	Bitmap           *Bitmap     `protobuf:"bytes,1,opt,name=Bitmap" json:"Bitmap,omitempty"`
+	N                *uint64     `protobuf:"varint,2,opt,name=N" json:"N,omitempty"`
+	Pairs            []*Pair     `protobuf:"bytes,3,rep,name=Pairs" json:"Pairs,omitempty"`
+	Changed          *bool       `protobuf:"varint,4,opt,name=Changed" json:"Changed,omitempty"`
+	Bicliques        []*Biclique `protobuf:"bytes,5,rep,name=Bicliques" json:"Bicliques,omitempty"`
+	XXX_unrecognized []byte      `json:"-"`
+}
+
+func (m *QueryResult) Reset()         { *m = QueryResult{} }
+func (m *QueryResult) String() string { return proto.CompactTextString(m) }
+func (*QueryResult) ProtoMessage()    {}
+
+func (m *QueryResult) GetBitmap() *Bitmap {
+	if m != nil {
+		return m.Bitmap
+	}
+	return nil
+}
+
+func (m *QueryResult) GetN() uint64 {
+	if m != nil && m.N != nil {
+		return *m.N
+	}
+	return 0
+}
+
+func (m *QueryResult) GetPairs() []*Pair {
+	if m != nil {
+		return m.Pairs
+	}
+	return nil
+}
+
+func (m *QueryResult) GetChanged() bool {
 	if m != nil && m.Changed != nil {
 		return *m.Changed
 	}
 	return false
 }
 
-func (m *QueryResponse) GetBicliques() []*Biclique {
+func (m *QueryResult) GetBicliques() []*Biclique {
 	if m != nil {
 		return m.Bicliques
 	}
@@ -470,6 +495,7 @@ func init() {
 	proto.RegisterType((*AttrMap)(nil), "internal.AttrMap")
 	proto.RegisterType((*QueryRequest)(nil), "internal.QueryRequest")
 	proto.RegisterType((*QueryResponse)(nil), "internal.QueryResponse")
+	proto.RegisterType((*QueryResult)(nil), "internal.QueryResult")
 	proto.RegisterType((*ImportRequest)(nil), "internal.ImportRequest")
 	proto.RegisterType((*ImportResponse)(nil), "internal.ImportResponse")
 	proto.RegisterType((*Cache)(nil), "internal.Cache")

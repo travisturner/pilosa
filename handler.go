@@ -29,7 +29,7 @@ type Handler struct {
 
 	// The execution engine for running queries.
 	Executor interface {
-		Execute(db string, query *pql.Query, slices []uint64, opt *ExecOptions) (interface{}, error)
+		Execute(db string, query *pql.Query, slices []uint64, opt *ExecOptions) ([]interface{}, error)
 	}
 
 	// The version to report on the /version endpoint.
@@ -115,6 +115,7 @@ func (h *Handler) handlePostQuery(w http.ResponseWriter, r *http.Request) {
 	opt := &ExecOptions{
 		Timestamp: req.Timestamp,
 		Quantum:   req.Quantum,
+		Remote:    req.Remote,
 	}
 
 	// Parse query string.
@@ -126,12 +127,23 @@ func (h *Handler) handlePostQuery(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Execute the query.
-	result, err := h.Executor.Execute(req.DB, q, req.Slices, opt)
-	resp := &QueryResponse{Result: result, Err: err}
+	results, err := h.Executor.Execute(req.DB, q, req.Slices, opt)
+	resp := &QueryResponse{Results: results, Err: err}
 
 	// Fill profile attributes if requested.
-	if bm, ok := result.(*Bitmap); ok && req.Profiles {
-		profiles, err := h.readProfiles(h.Index.DB(req.DB), bm.Bits())
+	if req.Profiles {
+		// Consolidate all profile ids across all calls.
+		var profileIDs []uint64
+		for _, result := range results {
+			bm, ok := result.(*Bitmap)
+			if !ok {
+				continue
+			}
+			profileIDs = uint64Slice(profileIDs).merge(bm.Bits())
+		}
+
+		// Retrieve profile attributes across all calls.
+		profiles, err := h.readProfiles(h.Index.DB(req.DB), profileIDs)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			h.writeQueryResponse(w, r, &QueryResponse{Err: err})
@@ -152,7 +164,6 @@ func (h *Handler) handlePostQuery(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleGetSliceMax(w http.ResponseWriter, r *http.Request) error {
-
 	sm := h.Index.SliceN()
 	if strings.Contains(r.Header.Get("Accept"), "application/x-protobuf") {
 		pb := &internal.SliceMaxResponse{
@@ -165,8 +176,11 @@ func (h *Handler) handleGetSliceMax(w http.ResponseWriter, r *http.Request) erro
 		}
 		return nil
 	}
-	resp := map[string]uint64{"SliceMax": sm}
-	return json.NewEncoder(w).Encode(resp)
+	return json.NewEncoder(w).Encode(sliceMaxResponse{SliceMax: sm})
+}
+
+type sliceMaxResponse struct {
+	SliceMax uint64 `json:"SliceMax"`
 }
 
 // readProfiles returns a list of profile objects by id.
@@ -473,6 +487,10 @@ type QueryRequest struct {
 
 	// Time granularity to use with the timestamp.
 	Quantum TimeQuantum
+
+	// If true, indicates that query is part of a larger distributed query.
+	// If false, this request is on the originating node.
+	Remote bool
 }
 
 func decodeQueryRequest(pb *internal.QueryRequest) *QueryRequest {
@@ -482,6 +500,7 @@ func decodeQueryRequest(pb *internal.QueryRequest) *QueryRequest {
 		Slices:   pb.GetSlices(),
 		Profiles: pb.GetProfiles(),
 		Quantum:  TimeQuantum(pb.GetQuantum()),
+		Remote:   pb.GetRemote(),
 	}
 
 	if pb.Timestamp != nil {
@@ -494,9 +513,9 @@ func decodeQueryRequest(pb *internal.QueryRequest) *QueryRequest {
 
 // QueryResponse represent a response from a processed query.
 type QueryResponse struct {
-	// Query execution results.
+	// Result for each top-level query call.
 	// Can be a Bitmap, Pairs, or uint64.
-	Result interface{}
+	Results []interface{}
 
 	// Set of profiles matching IDs returned in Result.
 	Profiles []*Profile
@@ -507,11 +526,11 @@ type QueryResponse struct {
 
 func (resp *QueryResponse) MarshalJSON() ([]byte, error) {
 	var output struct {
-		Result   interface{} `json:"result,omitempty"`
-		Profiles []*Profile  `json:"profiles,omitempty"`
-		Err      string      `json:"error,omitempty"`
+		Results  []interface{} `json:"results,omitempty"`
+		Profiles []*Profile    `json:"profiles,omitempty"`
+		Err      string        `json:"error,omitempty"`
 	}
-	output.Result = resp.Result
+	output.Results = resp.Results
 	output.Profiles = resp.Profiles
 
 	if resp.Err != nil {
@@ -522,23 +541,26 @@ func (resp *QueryResponse) MarshalJSON() ([]byte, error) {
 
 func encodeQueryResponse(resp *QueryResponse) *internal.QueryResponse {
 	pb := &internal.QueryResponse{
+		Results:  make([]*internal.QueryResult, len(resp.Results)),
 		Profiles: encodeProfiles(resp.Profiles),
 	}
 
-	if resp.Result != nil {
-		switch result := resp.Result.(type) {
+	for i := range resp.Results {
+		pb.Results[i] = &internal.QueryResult{}
+
+		switch result := resp.Results[i].(type) {
 		case *Bitmap:
-			pb.Bitmap = encodeBitmap(result)
+			pb.Results[i].Bitmap = encodeBitmap(result)
 		case []Pair:
-			pb.Pairs = encodePairs(result)
+			pb.Results[i].Pairs = encodePairs(result)
 		case uint64:
-			pb.N = proto.Uint64(result)
+			pb.Results[i].N = proto.Uint64(result)
 		case bool:
-			pb.Changed = proto.Bool(result)
+			pb.Results[i].Changed = proto.Bool(result)
 		case []Biclique:
-			pb.Bicliques = encodeBicliques(result)
+			pb.Results[i].Bicliques = encodeBicliques(result)
 		default:
-			panic(fmt.Sprintf("invalid query result type: %T", resp.Result))
+			panic(fmt.Sprintf("invalid query result type: %T", resp.Results[i]))
 		}
 	}
 

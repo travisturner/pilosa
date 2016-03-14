@@ -3,17 +3,24 @@ package pql
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
 
 // Query represents a PQL query.
 type Query struct {
-	Root Call
+	Calls Calls
 }
 
 // String returns a string representation of the query.
-func (q *Query) String() string { return q.Root.String() }
+func (q *Query) String() string {
+	a := make([]string, len(q.Calls))
+	for i, call := range q.Calls {
+		a[i] = call.String()
+	}
+	return strings.Join(a, "\n")
+}
 
 // Node represents any node in the AST.
 type Node interface {
@@ -297,12 +304,15 @@ func (c *SetProfileAttrs) String() string {
 type TopN struct {
 	Frame string
 
+	// Maximum number of results to return.
+	N int
+
 	// Bitmap to use for intersection while computing top results.
 	// Original bitmap counts are used if no Src is provided.
 	Src BitmapCall
 
-	// Maximum number of results to return.
-	N int
+	// Specific bitmaps to retrieve.
+	BitmapIDs []uint64
 
 	// Field name and values to filter on.
 	Field   string
@@ -320,6 +330,13 @@ func (c *TopN) String() string {
 	}
 	if c.N > 0 {
 		args = append(args, fmt.Sprintf("n=%d", c.N))
+	}
+	if len(c.BitmapIDs) > 0 {
+		strs := make([]string, len(c.BitmapIDs))
+		for i := range c.BitmapIDs {
+			strs[i] = strconv.FormatUint(c.BitmapIDs[i], 10)
+		}
+		args = append(args, fmt.Sprintf("ids=[%s]", strings.Join(strs, ",")))
 	}
 	if c.Field != "" {
 		args = append(args, fmt.Sprintf("field=%q", c.Field))

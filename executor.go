@@ -238,11 +238,11 @@ func (e *Executor) executeBiclique(db string, c *pql.Bicliques, slices []uint64,
 		}
 
 		// Otherwise execute remotely.
-		res, err := e.exec(node, db, &pql.Query{Root: c}, nodeSlices, opt)
+		res, err := e.exec(node, db, &pql.Query{Calls: []pql.Call{c}}, nodeSlices, opt)
 		if err != nil {
 			return nil, err
 		}
-		results = Bicliques(results).Add(res.([]Biclique))
+		results = Bicliques(results).Add(res[0].([]Biclique))
 	}
 
 	// Sort final merged results.
@@ -575,7 +575,7 @@ func (e *Executor) exec(node *Node, db string, q *pql.Query, slices []uint64, op
 		case *pql.TopN:
 			v, err = decodePairs(pb.Results[i].GetPairs()), nil
 		case *pql.Bicliques:
-			return decodeBicliques(pb.Results[i].GetBicliques()), nil
+			v, err = decodeBicliques(pb.Results[i].GetBicliques()), nil
 		case *pql.Count:
 			v, err = pb.Results[i].GetN(), nil
 		case *pql.SetBit:

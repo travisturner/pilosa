@@ -196,7 +196,7 @@ func TestExecutor_Execute_Biclique(t *testing.T) {
 	e := NewExecutor(idx.Index, NewCluster(1))
 	if result, err := e.Execute("d", MustParse(`Bicliques(frame=f, n=2)`), nil, nil); err != nil {
 		t.Fatal(err)
-	} else if !reflect.DeepEqual(result, []pilosa.Biclique{
+	} else if !reflect.DeepEqual(result[0], []pilosa.Biclique{
 		{Tiles: []uint64{3, 1}, Count: 5, Score: 10},
 		{Tiles: []uint64{3}, Count: 9, Score: 9},
 	}) {
@@ -221,7 +221,7 @@ func TestExecutor_Execute_TopN_fill(t *testing.T) {
 	e := NewExecutor(idx.Index, NewCluster(1))
 	if result, err := e.Execute("d", MustParse(`TopN(frame=f, n=1)`), nil, nil); err != nil {
 		t.Fatal(err)
-	} else if !reflect.DeepEqual(result, []pilosa.Pair{
+	} else if !reflect.DeepEqual(result[0], []pilosa.Pair{
 		{Key: 0, Count: 4},
 	}) {
 		t.Fatalf("unexpected result: %s", spew.Sdump(result))
@@ -250,28 +250,6 @@ func TestExecutor_Execute_TopN(t *testing.T) {
 		{Key: 0, Count: 5},
 		{Key: 10, Count: 2},
 	}) {
-		t.Fatalf("unexpected result: %s", spew.Sdump(result))
-	}
-}
-func TestExecutor_Execute_TopN_fill(t *testing.T) {
-	idx := MustOpenIndex()
-	defer idx.Close()
-
-	// Set bits for bitmaps 0, 10, & 20 across two slices.
-	idx.MustCreateFragmentIfNotExists("d", "f", 0).SetBit(0, 0, nil, 0)
-	idx.MustCreateFragmentIfNotExists("d", "f", 0).SetBit(0, 1, nil, 0)
-	idx.MustCreateFragmentIfNotExists("d", "f", 0).SetBit(0, 2, nil, 0)
-	idx.MustCreateFragmentIfNotExists("d", "f", 1).SetBit(0, SliceWidth, nil, 0)
-	idx.MustCreateFragmentIfNotExists("d", "f", 1).SetBit(1, SliceWidth+2, nil, 0)
-	idx.MustCreateFragmentIfNotExists("d", "f", 1).SetBit(1, SliceWidth, nil, 0)
-
-	// Execute query.
-	e := NewExecutor(idx.Index, NewCluster(1))
-	if result, err := e.Execute("d", MustParse(`TopN(frame=f, n=1)`), nil, nil); err != nil {
-		t.Fatal(err)
-	} else if !reflect.DeepEqual(result, []interface{}{[]pilosa.Pair{
-		{Key: 0, Count: 4},
-	}}) {
 		t.Fatalf("unexpected result: %s", spew.Sdump(result))
 	}
 }

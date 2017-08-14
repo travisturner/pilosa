@@ -16,7 +16,9 @@ package pilosa
 
 import (
 	"encoding/binary"
+	"fmt"
 	"hash/fnv"
+	"reflect"
 	"time"
 
 	"github.com/pilosa/pilosa/internal"
@@ -32,8 +34,17 @@ const (
 
 // NodeState represents node state returned in /status endpoint for a node in the cluster.
 const (
-	NodeStateUp   = "UP"
-	NodeStateDown = "DOWN"
+	NodeStateStarting = "STARTING"
+	NodeStateUp       = "UP" // TODO travis remove this
+	NodeStateDown     = "DOWN"
+	NodeStateNormal   = "NORMAL"
+	NodeStateSettling = "SETTLING"
+	NodeStateJoining  = "JOINING"
+	NodeStateLeaving  = "LEAVING"
+
+	NodeStateTaxonomyLoaded    = "TAXONOMY-LOADED"
+	NodeStateTaxonomyConfirmed = "TAXONOMY-CONFIRMED"
+	NodeStateRebalancing       = "REBALANCING"
 )
 
 // Node represents a node in the cluster.
@@ -44,16 +55,50 @@ type Node struct {
 }
 
 // SetStatus sets the NodeStatus.
-func (n *Node) SetStatus(s *internal.NodeStatus) {
+func (n *Node) SetStatus(s *internal.NodeStatus) bool {
+	if n.status == nil {
+		n.status = s
+		return true
+	}
+
+	changed := false
+	if n.status.State != s.State {
+		changed = true
+	}
+	if !reflect.DeepEqual(n.status.HostList, s.HostList) {
+		changed = true
+	}
 	n.status = s
+	return changed
 }
 
-// SetState sets the Node.status.state.
-func (n *Node) SetState(s string) {
+// TODO travis: maybe we need a Server.SetState() too, that calls this?
+// because we're maintaining Server.State as well as Server.Cluster.Nodes(node).State
+// and setting the state for self (i.e. Server) should update Cluster.Nodes as well
+// SetState sets the Node.status.state. Returns true if state changed.
+func (n *Node) SetState(s string) bool {
+	changed := false
 	if n.status == nil {
 		n.status = &internal.NodeStatus{}
 	}
-	n.status.State = s
+	if n.status.State != s {
+		n.status.State = s
+		changed = true
+	}
+	return changed
+}
+
+// SetHostList sets the host list according to the node.
+func (n *Node) SetHostList(h []string) bool {
+	changed := false
+	if n.status == nil {
+		n.status = &internal.NodeStatus{}
+	}
+	if !reflect.DeepEqual(n.status.HostList, h) {
+		n.status.HostList = h
+		changed = true
+	}
+	return changed
 }
 
 // Nodes represents a list of nodes.
@@ -101,13 +146,53 @@ func (a Nodes) FilterHost(host string) []*Node {
 	return other
 }
 
-// Hosts returns a list of all hostnames.
+// Hosts returns a list of all hostnames. // TODO travis: check this
 func (a Nodes) Hosts() []string {
 	hosts := make([]string, len(a))
 	for i, n := range a {
 		hosts[i] = n.Host
 	}
 	return hosts
+}
+
+// StatesMatch returns true if the state for every node is the same.
+func (a Nodes) StatesMatch() bool {
+	var compare string
+	for i, n := range a {
+		if i == 0 {
+			compare = n.status.State
+			continue
+		}
+		if compare != n.status.State {
+			return false
+		}
+	}
+	return true
+}
+
+// HostListsMatch returns true if the hostlist for every node is the same.
+func (a Nodes) HostListsMatch() bool {
+	var compare []string
+	for i, n := range a {
+		if i == 0 {
+			compare = n.status.HostList
+			continue
+		}
+		if !reflect.DeepEqual(n.status.HostList, compare) {
+			return false
+		}
+	}
+	return true
+}
+
+// StatesIn returns true if the state for every node is in options.
+func (a Nodes) StatesIn(options []string) bool {
+	for _, n := range a {
+		if !StringInSlice(n.status.State, options) {
+			return false
+		}
+	}
+	return true
 }
 
 // Clone returns a shallow copy of nodes.
@@ -117,9 +202,17 @@ func (a Nodes) Clone() []*Node {
 	return other
 }
 
+// ByHost implements sort.Interface for []Node based on
+// the Host field.
+type ByHost []*Node
+
+func (h ByHost) Len() int           { return len(h) }
+func (h ByHost) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h ByHost) Less(i, j int) bool { return h[i].Host < h[j].Host }
+
 // Cluster represents a collection of nodes.
 type Cluster struct {
-	Nodes   []*Node
+	Nodes   []*Node // TODO travis phase this out?
 	NodeSet NodeSet
 
 	// Hashing algorithm used to assign partitions to nodes.
@@ -142,6 +235,15 @@ func NewCluster() *Cluster {
 		PartitionN: DefaultPartitionN,
 		ReplicaN:   DefaultReplicaN,
 	}
+}
+
+// TODO travis
+func (c *Cluster) Debug() string {
+	r := ""
+	for i, n := range c.Nodes {
+		r += fmt.Sprintf("\n --- node%v: %s (%s) <%v>", i, n.Host, n.status.State, n.status.HostList)
+	}
+	return r
 }
 
 // NodeSetHosts returns the list of host strings for NodeSet members.

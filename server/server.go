@@ -114,9 +114,10 @@ func (m *Command) SetupServer() error {
 	cluster := pilosa.NewCluster()
 	cluster.ReplicaN = m.Config.Cluster.ReplicaN
 
-	for _, hostport := range m.Config.Cluster.Hosts {
-		cluster.Nodes = append(cluster.Nodes, &pilosa.Node{Host: hostport})
-	}
+	// TODO travis: we don't want to set cluster.Nodes from the config anymore
+	//for _, hostport := range m.Config.Cluster.Hosts {
+	//	cluster.Nodes = append(cluster.Nodes, &pilosa.Node{Host: hostport})
+	//}
 	m.Server.Cluster = cluster
 
 	// Setup logging output.

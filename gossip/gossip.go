@@ -138,6 +138,8 @@ func NewGossipNodeSet(name string, gossipHost string, gossipPort int, gossipSeed
 	g.config.memberlistConfig.BindPort = gossipPort
 	g.config.memberlistConfig.AdvertiseAddr = pilosa.HostToIP(gossipHost)
 	g.config.memberlistConfig.AdvertisePort = gossipPort
+	//g.config.memberlistConfig.PushPullInterval = 800 * time.Millisecond
+	g.config.memberlistConfig.PushPullInterval = 0 * time.Millisecond
 	g.config.memberlistConfig.Delegate = g
 
 	g.statusHandler = server
@@ -232,7 +234,7 @@ func (g *GossipNodeSet) LocalState(join bool) []byte {
 }
 
 // MergeRemoteState implementation of the memberlist.Delegate interface
-// receive and process the remote side side's LocalState.
+// receive and process the remote side's LocalState.
 func (g *GossipNodeSet) MergeRemoteState(buf []byte, join bool) {
 	// Unmarshal nodestate data.
 	var pb internal.NodeStatus
@@ -240,6 +242,7 @@ func (g *GossipNodeSet) MergeRemoteState(buf []byte, join bool) {
 		g.logger().Printf("error unmarshalling nodestate data, err=%s", err)
 		return
 	}
+	fmt.Println("*** MergeRemoteState ***", pb)
 	err := g.statusHandler.HandleRemoteStatus(&pb)
 	if err != nil {
 		g.logger().Printf("merge state error: %s", err)

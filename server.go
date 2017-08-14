@@ -26,6 +26,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,6 +41,8 @@ import (
 const (
 	DefaultAntiEntropyInterval = 10 * time.Minute
 	DefaultPollingInterval     = 60 * time.Second
+	DefaultStateCheckInterval  = 20000 * time.Millisecond
+	DefaultStartWaitTime       = 5000 * time.Millisecond
 )
 
 // Server represents a holder wrapped by a running HTTP server.
@@ -62,9 +65,13 @@ type Server struct {
 	Host    string
 	Cluster *Cluster
 
+	// TODO travis: figure out better way to handle these public attributes
+	State string
+
 	// Background monitoring intervals.
 	AntiEntropyInterval time.Duration
 	PollingInterval     time.Duration
+	StateCheckInterval  time.Duration
 	MetricInterval      time.Duration
 
 	// Misc options.
@@ -87,6 +94,7 @@ func NewServer() *Server {
 
 		AntiEntropyInterval: DefaultAntiEntropyInterval,
 		PollingInterval:     DefaultPollingInterval,
+		StateCheckInterval:  DefaultStateCheckInterval,
 		MetricInterval:      0,
 
 		LogOutput: os.Stderr,
@@ -99,6 +107,10 @@ func NewServer() *Server {
 
 // Open opens and initializes the server.
 func (s *Server) Open() error {
+
+	// Server always comes up in state JOINING until cluster membership is determined.
+	s.State = NodeStateStarting
+
 	// Require a port in the hostname.
 	host, port, err := net.SplitHostPort(s.Host)
 	if err != nil {
@@ -117,31 +129,73 @@ func (s *Server) Open() error {
 	// Determine hostname based on listening port.
 	s.Host = net.JoinHostPort(host, strconv.Itoa(s.ln.Addr().(*net.TCPAddr).Port))
 
+	// TODO travis: i think len should ALWAYS be 0 at this point. (maybe not if we load .taxonomy first?)
 	// Create local node if no cluster is specified.
 	if len(s.Cluster.Nodes) == 0 {
-		s.Cluster.Nodes = []*Node{{Host: s.Host}}
+		node := &Node{Host: s.Host}
+		node.SetState(s.State)
+		s.Cluster.Nodes = []*Node{node}
 	}
 
-	for i, n := range s.Cluster.Nodes {
-		if s.Cluster.NodeByHost(n.Host) != nil {
-			s.Holder.Stats = s.Holder.Stats.WithTags(fmt.Sprintf("NodeID:%d", i))
-		}
-	}
-
-	// Open holder.
-	s.Holder.LogOutput = s.LogOutput
-	if err := s.Holder.Open(); err != nil {
-		return fmt.Errorf("opening Holder: %v", err)
-	}
-
+	/*
+	   TODO travis:
+	       - load .taxonomy
+	           - if .taxonomy doesn't exists, continue
+	       - open gossip
+	       - wait for gossip to agree/settle
+	       - if .taxonomy and gossip nodes don't agree, hold in some STARTING state?
+	           - else write .taxonomy file
+	       - open holder
+	*/
+	// Open NodeSet communication
+	fmt.Println("BroadcastReceiver.Start()")
 	if err := s.BroadcastReceiver.Start(s); err != nil {
 		return fmt.Errorf("starting BroadcastReceiver: %v", err)
 	}
-
-	// Open NodeSet communication
+	fmt.Println("NodeSet.Open()")
 	if err := s.Cluster.NodeSet.Open(); err != nil {
 		return fmt.Errorf("opening NodeSet: %v", err)
 	}
+	/*------------------------------------------*/
+
+	// send a gossip message that state has changed
+	// TODO send gossip
+	/*
+		err = s.broadcastStatus()
+		if err != nil {
+			return fmt.Errorf("broadcasting local status: %v", err)
+		}
+	*/
+
+	// TODO travis: for now we want to wait until we reach node balance
+	// but really we should not use a wait but a channel that closes when balanced
+
+	/*
+		for i, n := range s.Cluster.Nodes {
+			if s.Cluster.NodeByHost(n.Host) != nil {
+				s.Holder.Stats = s.Holder.Stats.WithTags(fmt.Sprintf("NodeID:%d", i))
+			}
+		}
+	*/
+
+	/*
+		// Open holder.
+		s.Holder.LogOutput = s.LogOutput
+		if err := s.Holder.Open(); err != nil {
+			return fmt.Errorf("opening Holder: %v", err)
+		}
+	*/
+
+	/*
+	   if err := s.BroadcastReceiver.Start(s); err != nil {
+	       return fmt.Errorf("starting BroadcastReceiver: %v", err)
+	   }
+
+	   // Open NodeSet communication
+	   if err := s.Cluster.NodeSet.Open(); err != nil {
+	       return fmt.Errorf("opening NodeSet: %v", err)
+	   }
+	*/
 
 	// Create executor for executing queries.
 	e := NewExecutor()
@@ -161,19 +215,25 @@ func (s *Server) Open() error {
 	// Initialize Holder.
 	s.Holder.Broadcaster = s.Broadcaster
 
-	// Serve HTTP.
-	go func() {
-		err := http.Serve(ln, s.Handler)
-		if err != nil {
-			s.Logger().Printf("HTTP handler terminated with error: %s\n", err)
-		}
-	}()
+	/*
+		// Serve HTTP.
+		go func() {
+			err := http.Serve(ln, s.Handler)
+			if err != nil {
+				s.Logger().Printf("HTTP handler terminated with error: %s\n", err)
+			}
+		}()
+	*/
 
-	// Start background monitoring.
-	s.wg.Add(3)
-	go func() { defer s.wg.Done(); s.monitorAntiEntropy() }()
-	go func() { defer s.wg.Done(); s.monitorMaxSlices() }()
-	go func() { defer s.wg.Done(); s.monitorRuntime() }()
+	/*
+		// Start background monitoring.
+		s.wg.Add(3)
+		go func() { defer s.wg.Done(); s.monitorAntiEntropy() }()
+		go func() { defer s.wg.Done(); s.monitorMaxSlices() }()
+		go func() { defer s.wg.Done(); s.monitorRuntime() }()
+	*/
+	s.wg.Add(1)
+	go func() { defer s.wg.Done(); s.monitorState() }()
 
 	return nil
 }
@@ -244,6 +304,7 @@ func (s *Server) monitorAntiEntropy() {
 
 // monitorMaxSlices periodically pulls the highest slice from each node in the cluster.
 func (s *Server) monitorMaxSlices() {
+	// TODO travis: this could be a problem with gossip discovery of nodes
 	// Ignore if only one node in the cluster.
 	if len(s.Cluster.Nodes) <= 1 {
 		return
@@ -339,7 +400,13 @@ func (s *Server) ReceiveMessage(pb proto.Message) error {
 		if err != nil {
 			return err
 		}
+	case *internal.NodeStatus:
+		err := s.mergeRemoteStatus(obj)
+		if err != nil {
+			return err
+		}
 	}
+
 	return nil
 }
 
@@ -348,14 +415,18 @@ func (s *Server) ReceiveMessage(pb proto.Message) error {
 // In a gossip implementation, memberlist.Delegate.LocalState() uses this.
 // Server implements StatusHandler.
 func (s *Server) LocalStatus() (proto.Message, error) {
+	if s.Cluster == nil {
+		return nil, errors.New("Server.Cluster is nil")
+	}
 	if s.Holder == nil {
 		return nil, errors.New("Server.Holder is nil")
 	}
 
 	ns := internal.NodeStatus{
-		Host:    s.Host,
-		State:   NodeStateUp,
-		Indexes: EncodeIndexes(s.Holder.Indexes()),
+		Host:     s.Host,
+		State:    s.State,
+		Indexes:  EncodeIndexes(s.Holder.Indexes()),
+		HostList: Nodes(s.Cluster.Nodes).Hosts(),
 	}
 
 	// Append Slice list per this Node's indexes
@@ -373,15 +444,15 @@ func (s *Server) ClusterStatus() (proto.Message, error) {
 	if err != nil {
 		return nil, err
 	}
-	node := s.Cluster.NodeByHost(s.Host)
-	node.SetStatus(ns.(*internal.NodeStatus))
+	localNode := s.localNode()
+	localNode.SetStatus(ns.(*internal.NodeStatus))
 
 	// Update NodeState for all nodes.
 	for host, nodeState := range s.Cluster.NodeStates() {
 		// In a default configuration (or single-node) where a StaticNodeSet is used
 		// then all nodes are marked as DOWN. At the very least, we should consider
 		// the local node as UP.
-		// TODO: we should be able to remove this check if/when cluster.Nodes and
+		// TODO travis: we should be able to remove this check if/when cluster.Nodes and
 		// cluster.NodeSet are unified.
 		if host == s.Host {
 			nodeState = NodeStateUp
@@ -399,9 +470,31 @@ func (s *Server) HandleRemoteStatus(pb proto.Message) error {
 }
 
 func (s *Server) mergeRemoteStatus(ns *internal.NodeStatus) error {
+	fmt.Printf("mergeRemoteStatus on (%s): %s\n", s.Host, ns.HostList)
+
+	// Any time we change state for this node, we want to gossip that
+	// to the rest of the cluster.
+	broadcastChanges := false
+
+	// if ns.Host not in cluster.Nodes, add it:
+	remoteNode := s.Cluster.NodeByHost(ns.Host)
+	if remoteNode == nil {
+		remoteNode = &Node{Host: ns.Host}
+		s.Cluster.Nodes = append(s.Cluster.Nodes, remoteNode)
+
+		// All hosts must be merged in the same order on all nodes in the cluster.
+		sort.Sort(ByHost(s.Cluster.Nodes))
+
+		// gossip state
+		broadcastChanges = true
+
+		// localNode
+		localNode := s.localNode()
+		_ = localNode.SetHostList(s.HostList())
+	}
+
 	// Update Node.state.
-	node := s.Cluster.NodeByHost(ns.Host)
-	node.SetStatus(ns)
+	broadcastChanges = broadcastChanges || remoteNode.SetStatus(ns)
 
 	// Create indexes that don't exist.
 	for _, index := range ns.Indexes {
@@ -427,6 +520,152 @@ func (s *Server) mergeRemoteStatus(ns *internal.NodeStatus) error {
 		}
 	}
 
+	// TODO travis: we need to check here to see if we got any information
+	// that would put us into a different state (for example, if we are in
+	// state NORMAL, and we receive a state of JOINING from another node,
+	// then we need to go into a REBALANCING mode.
+	if s.State == NodeStateNormal {
+		if ns.State == NodeStateJoining {
+			s.setState(NodeStateRebalancing)
+			broadcastChanges = true
+		}
+	}
+
+	if broadcastChanges {
+		return s.broadcastStatus()
+	}
+
+	return nil
+}
+
+// TODO travis: move this down in the code
+// monitorState watches for changes in local state and acts upon them.
+func (s *Server) monitorState() {
+	fastInterval := s.StateCheckInterval / 10
+	ticker := time.NewTicker(fastInterval)
+	defer ticker.Stop()
+
+	broadcastAggressively := true
+
+	for {
+		select {
+		case <-s.closing:
+			return
+		case <-ticker.C:
+		}
+
+		// We need to watch other node states, not just our own
+		/*
+		   // if any node is in state JOINING and len(Indexes()) > 0
+		   // then node[0] needs to move to state COORDINATING-REBALANCE
+		   // in that state, as the coordinator, it needs to watch for
+		   // any new nodes that JOIN, and if that happens, abort the REBALANCE
+		   // and move back to state REBALANCING so we can trigger a new coordinator
+
+		*/
+
+		fmt.Printf("%s", s.Debug())
+		switch s.State {
+		case NodeStateStarting:
+			// If there is only one node in the cluster, wait here to give
+			// memberlist time to start.
+			if len(s.Cluster.Nodes) == 1 {
+				time.Sleep(DefaultStartWaitTime)
+			}
+			nodes := Nodes(s.Cluster.Nodes)
+			if false {
+				//* if HostList same on all nodes -> TAXONOMY-CONFIRMED
+				//hostList := s.HostList()
+			} else {
+				if nodes.StatesIn([]string{NodeStateStarting, NodeStateSettling}) {
+					s.setState(NodeStateSettling)
+				} else {
+					s.setState(NodeStateJoining)
+				}
+			}
+		case NodeStateJoining:
+			// if no indexes have been created yet, we assume an empty cluster and therefore
+			// we can change from JOINING to SETTLING
+			if len(s.Holder.Indexes()) == 0 {
+				s.setState(NodeStateSettling)
+			}
+		case NodeStateSettling:
+			nodes := Nodes(s.Cluster.Nodes)
+			if nodes.StatesIn([]string{NodeStateSettling, NodeStateNormal}) && nodes.HostListsMatch() {
+				s.setState(NodeStateNormal)
+			}
+		case NodeStateNormal:
+			// slow down the ticker
+			if broadcastAggressively {
+				ticker.Stop()
+				ticker = time.NewTicker(s.StateCheckInterval)
+				broadcastAggressively = false
+			}
+		case NodeStateRebalancing:
+			// speed up the ticker
+			if !broadcastAggressively {
+				ticker.Stop()
+				ticker = time.NewTicker(fastInterval)
+				broadcastAggressively = true
+			}
+			nodes := Nodes(s.Cluster.Nodes)
+			if nodes.StatesIn([]string{NodeStateRebalancing, NodeStateSettling}) {
+				s.setState(NodeStateSettling)
+			}
+		}
+		// keep sending status
+		if broadcastAggressively {
+			fmt.Println("BROADCAST FROM: ", s.Host)
+			s.broadcastStatus()
+		}
+	}
+}
+
+// HostList returns the list of hosts in the cluster.
+func (s *Server) HostList() []string {
+	return Nodes(s.Cluster.Nodes).Hosts()
+}
+
+func (s *Server) localNode() *Node {
+	localNode := s.Cluster.NodeByHost(s.Host)
+	return localNode
+}
+
+func (s *Server) setState(state string) {
+	switch s.State {
+	case NodeStateStarting:
+		if !StringInSlice(state, []string{NodeStateSettling, NodeStateJoining}) {
+			return
+		}
+	case NodeStateSettling:
+		if !StringInSlice(state, []string{NodeStateNormal}) {
+			return
+		}
+	case NodeStateNormal:
+		if !StringInSlice(state, []string{NodeStateRebalancing}) {
+			return
+		}
+	case NodeStateRebalancing:
+		if !StringInSlice(state, []string{NodeStateSettling}) {
+			return
+		}
+	}
+	s.State = state
+	localNode := s.localNode()
+	localNode.SetState(state)
+}
+
+func (s *Server) broadcastStatus() error {
+	// TODO send gossip
+	localStatus, err := s.LocalStatus()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("SendAsync-3(%s)\n", s.Host)
+	err = s.Broadcaster.SendSync(localStatus)
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -516,6 +755,23 @@ func (s *Server) monitorRuntime() {
 		s.Holder.Stats.Gauge("Mallocs", float64(m.Mallocs), 1.0)
 		s.Holder.Stats.Gauge("Frees", float64(m.Frees), 1.0)
 	}
+}
+
+// TODO travis
+func (s *Server) Debug() string {
+	r := "\n===============================================\n"
+	r += fmt.Sprintf("Host: %s\n", s.Host)
+	r += fmt.Sprintf("State: %s\n", s.State)
+	r += fmt.Sprintf("HostList: %s\n", s.HostList())
+	r += fmt.Sprintf("Cluster: %s\n", s.Cluster.Debug())
+
+	/*
+		for i, n := range c.Nodes {
+			r += fmt.Sprintf("\n --- node%v: %s (%s)", i, n.Host, n.status.State)
+		}
+	*/
+	r += "===============================================\n\n"
+	return r
 }
 
 // CountOpenFiles on opperating systems that support lsof

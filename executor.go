@@ -62,7 +62,7 @@ func NewExecutor() *Executor {
 	e := &Executor{
 		HTTPClient: http.DefaultClient,
 	}
-	e.register = &SimpleCache{make(map[uint64]*Bitmap)}
+	e.register = &SimpleCache{cache: make(map[uint64]*Bitmap)}
 	return e
 }
 

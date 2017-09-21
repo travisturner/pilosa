@@ -470,18 +470,23 @@ type BitmapCache interface {
 // A read-heavy use case would cause the cache to get bigger, potentially causing the
 // node to run out of memory.
 type SimpleCache struct {
+	mu    sync.RWMutex
 	cache map[uint64]*Bitmap
 }
 
 // Fetch retrieves the bitmap at the id in the cache.
 func (s *SimpleCache) Fetch(id uint64) (*Bitmap, bool) {
+	s.mu.RLock()
 	m, ok := s.cache[id]
+	s.mu.RUnlock()
 	return m, ok
 }
 
 // Add adds the bitmap to the cache, keyed on the id.
 func (s *SimpleCache) Add(id uint64, b *Bitmap) {
+	s.mu.Lock()
 	s.cache[id] = b
+	s.mu.Unlock()
 }
 
 // NopCache represents a no-op Cache implementation.

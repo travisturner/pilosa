@@ -249,7 +249,8 @@ func (s *Server) monitorMaxSlices() {
 		return
 	}
 
-	ticker := time.NewTicker(s.PollingInterval)
+	first := false
+	ticker := time.NewTicker(DefaultPollingInterval)
 	defer ticker.Stop()
 
 	for {
@@ -257,22 +258,26 @@ func (s *Server) monitorMaxSlices() {
 		case <-s.closing:
 			return
 		case <-ticker.C:
-		}
-
-		oldmaxslices := s.Holder.MaxSlices()
-		for _, node := range s.Cluster.Nodes {
-			if s.Host != node.Host {
-				maxSlices, _ := checkMaxSlices(node.Host)
-				for index, newmax := range maxSlices {
-					// if we don't know about an index locally, log an error because
-					// indexes should be created and synced prior to slice creation
-					if localIndex := s.Holder.Index(index); localIndex != nil {
-						if newmax > oldmaxslices[index] {
-							oldmaxslices[index] = newmax
-							localIndex.SetRemoteMaxSlice(newmax)
+			// Run the max slice check first on the default interval to enable configurations with long PollingIntervals.
+			if !first {
+				first = true
+				ticker = time.NewTicker(s.PollingInterval)
+			}
+			oldmaxslices := s.Holder.MaxSlices()
+			for _, node := range s.Cluster.Nodes {
+				if s.Host != node.Host {
+					maxSlices, _ := checkMaxSlices(node.Host)
+					for index, newmax := range maxSlices {
+						// if we don't know about an index locally, log an error because
+						// indexes should be created and synced prior to slice creation
+						if localIndex := s.Holder.Index(index); localIndex != nil {
+							if newmax > oldmaxslices[index] {
+								oldmaxslices[index] = newmax
+								localIndex.SetRemoteMaxSlice(newmax)
+							}
+						} else {
+							s.Logger().Printf("Local Index not found: %s", index)
 						}
-					} else {
-						s.Logger().Printf("Local Index not found: %s", index)
 					}
 				}
 			}

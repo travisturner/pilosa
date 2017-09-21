@@ -261,6 +261,7 @@ func (s *Server) monitorMaxSlices() {
 			// Run the max slice check first on the default interval to enable configurations with long PollingIntervals.
 			if !first {
 				first = true
+				ticker.Stop()
 				ticker = time.NewTicker(s.PollingInterval)
 			}
 			oldmaxslices := s.Holder.MaxSlices()

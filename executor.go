@@ -19,6 +19,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io/ioutil"
 	"net/http"
 	"net/url"
@@ -52,13 +53,17 @@ type Executor struct {
 
 	// Maximum number of SetBit() or ClearBit() commands per request.
 	MaxWritesPerRequest int
+
+	register BitmapCache
 }
 
 // NewExecutor returns a new instance of Executor.
 func NewExecutor() *Executor {
-	return &Executor{
+	e := &Executor{
 		HTTPClient: http.DefaultClient,
 	}
+	e.register = &SimpleCache{make(map[uint64]*Bitmap)}
+	return e
 }
 
 // Execute executes a PQL query.
@@ -316,6 +321,8 @@ func (e *Executor) executeBitmapCallSlice(ctx context.Context, index string, c *
 		return e.executeDifferenceSlice(ctx, index, c, slice)
 	case "Intersect":
 		return e.executeIntersectSlice(ctx, index, c, slice)
+	case "IntersectReg":
+		return e.executeIntersectRegSlice(ctx, index, c, slice)
 	case "Range":
 		return e.executeRangeSlice(ctx, index, c, slice)
 	case "Union":
@@ -590,6 +597,49 @@ func (e *Executor) executeIntersectSlice(ctx context.Context, index string, c *p
 	}
 	other.InvalidateCount()
 	return other, nil
+}
+
+// executeIntersecRegtSlice executes a intersect() call for a local slice, but first checks the register for a cached version.
+func (e *Executor) executeIntersectRegSlice(ctx context.Context, index string, c *pql.Call, slice uint64) (*Bitmap, error) {
+
+	// Create an integer hash to use for the register key.
+	hashString := fmt.Sprintf("%v-%s", slice, c.String())
+	hashID := hashStringToUint64(hashString)
+
+	// Check the register.
+	r, ok := e.register.Fetch(hashID)
+	if ok && r != nil {
+		return r, nil
+	}
+
+	var other *Bitmap
+	if len(c.Children) == 0 {
+		return nil, fmt.Errorf("empty Intersect query is currently not supported")
+	}
+	for i, input := range c.Children {
+		bm, err := e.executeBitmapCallSlice(ctx, index, input, slice)
+		if err != nil {
+			return nil, err
+		}
+
+		if i == 0 {
+			other = bm
+		} else {
+			other = other.Intersect(bm)
+		}
+	}
+	other.InvalidateCount()
+
+	// Add to the register.
+	e.register.Add(hashID, other)
+
+	return other, nil
+}
+
+func hashStringToUint64(s string) uint64 {
+	h := fnv.New64a()
+	h.Write([]byte(s))
+	return h.Sum64()
 }
 
 // executeRangeSlice executes a range() call for a local slice.

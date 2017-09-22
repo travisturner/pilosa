@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/gogo/protobuf/proto"
@@ -40,6 +41,46 @@ const (
 	MinThreshold = 1
 )
 
+// TEST
+type LocalCache struct {
+	mu    sync.RWMutex
+	cache map[uint64]*Bitmap
+}
+
+// Fetch retrieves the bitmap at the id in the cache.
+func (s *LocalCache) Fetch(id uint64) (*Bitmap, bool) {
+	s.mu.RLock()
+	m, ok := s.cache[id]
+	s.mu.RUnlock()
+	return m, ok
+}
+
+// fetch retrieves the bitmap at the id in the cache.
+func (s *LocalCache) fetch(id uint64) (*Bitmap, bool) {
+	m, ok := s.cache[id]
+	return m, ok
+}
+
+// Add adds the bitmap to the cache, keyed on the id.
+func (s *LocalCache) Add(id uint64, b *Bitmap) {
+	s.mu.Lock()
+	s.cache[id] = b
+	s.mu.Unlock()
+}
+
+// add adds the bitmap to the cache, keyed on the id.
+func (s *LocalCache) add(id uint64, b *Bitmap) {
+	s.cache[id] = b
+}
+
+func (s *LocalCache) GetLock() {
+	s.mu.Lock()
+}
+
+func (s *LocalCache) ReleaseLock() {
+	s.mu.Unlock()
+}
+
 // Executor recursively executes calls in a PQL query across all slices.
 type Executor struct {
 	Holder *Holder
@@ -54,7 +95,8 @@ type Executor struct {
 	// Maximum number of SetBit() or ClearBit() commands per request.
 	MaxWritesPerRequest int
 
-	register BitmapCache
+	//register BitmapCache
+	register *LocalCache
 }
 
 // NewExecutor returns a new instance of Executor.
@@ -62,7 +104,8 @@ func NewExecutor() *Executor {
 	e := &Executor{
 		HTTPClient: http.DefaultClient,
 	}
-	e.register = &SimpleCache{cache: make(map[uint64]*Bitmap)}
+	//e.register = &SimpleCache{cache: make(map[uint64]*Bitmap)}
+	e.register = &LocalCache{cache: make(map[uint64]*Bitmap)}
 	return e
 }
 
@@ -608,7 +651,15 @@ func (e *Executor) executeIntersectRegSlice(ctx context.Context, index string, c
 
 	// Check the register.
 	r, ok := e.register.Fetch(hashID)
-	if ok && r != nil {
+	if ok {
+		return r, nil
+	}
+
+	e.register.GetLock()
+	defer e.register.ReleaseLock()
+
+	r, ok = e.register.fetch(hashID)
+	if ok {
 		return r, nil
 	}
 
@@ -631,7 +682,7 @@ func (e *Executor) executeIntersectRegSlice(ctx context.Context, index string, c
 	other.InvalidateCount()
 
 	// Add to the register.
-	e.register.Add(hashID, other)
+	e.register.add(hashID, other)
 
 	return other, nil
 }

@@ -1764,7 +1764,14 @@ type ContainerInfo struct {
 	Pointer unsafe.Pointer // offset within the mmap
 }
 
-func intersectionCount(a, b *container) int {
+func intersectionCount(x, y *container) int {
+	a := x
+	b := y
+	if x.n > y.n {
+		b = x
+		a = y
+	}
+
 	if a.isArray() {
 		if b.isArray() {
 			return intersectionCountArrayArray(a, b)
@@ -1920,7 +1927,13 @@ func intersectionCountBitmapBitmap(a, b *container) (n int) {
 	return int(popcntAndSlice(a.bitmap, b.bitmap))
 }
 
-func intersect(a, b *container) *container {
+func intersect(x, y *container) *container {
+	a := x
+	b := y
+	if x.n > y.n {
+		a = y
+		b = x
+	}
 	if a.isArray() {
 		if b.isArray() {
 			return intersectArrayArray(a, b)

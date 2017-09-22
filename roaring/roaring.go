@@ -2157,7 +2157,14 @@ func intersectBitmapBitmap(a, b *container) *container {
 	return output
 }
 
-func union(a, b *container) *container {
+func union(x, y *container) *container {
+	a := x
+	b := y
+	if x.n < y.n {
+		a = y
+		b = x
+	}
+
 	if a.isArray() {
 		if b.isArray() {
 			return unionArrayArray(a, b)

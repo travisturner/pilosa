@@ -476,9 +476,9 @@ type SimpleCache struct {
 
 // Fetch retrieves the bitmap at the id in the cache.
 func (s *SimpleCache) Fetch(id uint64) (*Bitmap, bool) {
-	s.mu.RLock()
+	s.mu.Lock()
 	m, ok := s.cache[id]
-	s.mu.RUnlock()
+	s.mu.Unlock()
 	return m, ok
 }
 

@@ -17,9 +17,11 @@ package cmd
 import (
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/signal"
 	"runtime/pprof"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -44,7 +46,12 @@ It will load existing data from the configured
 directory, and start listening client connections
 on the configured port.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			fmt.Fprintf(Server.Stderr, "Pilosa %s, build time %s\n", pilosa.Version, pilosa.BuildTime)
+			logOutput, err := server.GetLogWriter(Server.Config.LogPath, stderr)
+			if err != nil {
+				return err
+			}
+			logger := log.New(logOutput, "", log.LstdFlags)
+			logger.Printf("Pilosa %s, build time %s\n", pilosa.Version, pilosa.BuildTime)
 
 			// Start CPU profiling.
 			if Server.CPUProfile != "" {
@@ -70,10 +77,10 @@ on the configured port.`,
 
 			// First SIGKILL causes server to shut down gracefully.
 			c := make(chan os.Signal, 2)
-			signal.Notify(c, os.Interrupt)
+			signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 			select {
 			case sig := <-c:
-				fmt.Fprintf(Server.Stderr, "Received %s; gracefully shutting down...\n", sig.String())
+				logger.Printf("Received %s; gracefully shutting down...\n", sig.String())
 
 				// Second signal causes a hard shutdown.
 				go func() { <-c; os.Exit(1) }()
@@ -82,7 +89,7 @@ on the configured port.`,
 					return err
 				}
 			case <-Server.Done:
-				fmt.Fprintf(Server.Stderr, "Server closed externally")
+				logger.Printf("Server closed externally")
 			}
 			return nil
 		},

@@ -1,5 +1,10 @@
 +++
 title = "WebUI"
+weight = 9
+nav = [
+    "Console",
+    "Cluster Admin",
+]
 +++
 
 ## WebUI
@@ -25,10 +30,10 @@ In addition to standard PQL, the console supports a few special commands, prefix
 - `:create frame <framename>`
 - `:delete frame <framename>`
 
-Index and frame creation also supports options like `columnLabel`,`rowLabel` or `inverseEnabled`. When creating new index or new frame, add options by using the keys documented in [API reference](../api-reference).
+Frame creation also supports options like `timeQuantum` or `inverseEnabled`. When creating a new frame, add options by using the keys documented in [API reference](../api-reference).
 
-- `:create index <indexname> columnLabel=col_id`
-- `:create frame <framename> rowLabel=row_id inverseEnabled=true cacheSize=10000`
+- `:create index <indexname> timeQuantum=YM`
+- `:create frame <framename> inverseEnabled=true cacheSize=10000`
 
 
 ### Cluster Admin

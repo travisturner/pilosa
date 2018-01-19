@@ -16,11 +16,13 @@ package ctl
 
 import (
 	"bytes"
-	"github.com/pilosa/pilosa"
-	"golang.org/x/net/context"
+	"context"
 	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/pilosa/pilosa"
+	"github.com/pilosa/pilosa/test"
 )
 
 func TestExportCommand_Validation(t *testing.T) {
@@ -53,23 +55,27 @@ func TestExportCommand_Run(t *testing.T) {
 	stdin, stdout, stderr := GetIO(buf)
 	cm := NewExportCommand(stdin, stdout, stderr)
 
-	hldr := MustOpenHolder()
+	hldr := test.MustOpenHolder()
 	defer hldr.Close()
-	s := NewServer()
+	s := test.NewServer()
 	defer s.Close()
-	s.Handler.Host = s.Host()
-	s.Handler.Cluster = NewCluster(1)
+	uri, err := pilosa.NewURIFromAddress(s.Host())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Handler.URI = uri
+	s.Handler.Cluster = test.NewCluster(1)
 	s.Handler.Cluster.Nodes[0].Host = s.Host()
 	s.Handler.Holder = hldr.Holder
 	cm.Host = s.Host()
 
-	http.DefaultClient.Do(MustNewHTTPRequest("POST", s.URL+"/index/i", strings.NewReader("")))
-	http.DefaultClient.Do(MustNewHTTPRequest("POST", s.URL+"/index/i/frame/f", strings.NewReader("")))
+	http.DefaultClient.Do(test.MustNewHTTPRequest("POST", s.URL+"/index/i", strings.NewReader("")))
+	http.DefaultClient.Do(test.MustNewHTTPRequest("POST", s.URL+"/index/i/frame/f", strings.NewReader("")))
 
 	cm.Index = "i"
 	cm.Frame = "f"
 	cm.View = pilosa.ViewStandard
-	err := cm.Run(context.Background())
+	err = cm.Run(context.Background())
 	if err != nil {
 		t.Fatalf("Export Run doesn't work: %s", err)
 	}

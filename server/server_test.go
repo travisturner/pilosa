@@ -22,21 +22,19 @@ import (
 	"io"
 	"io/ioutil"
 	"math/rand"
-	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"reflect"
 	"runtime"
 	"sort"
-	"strconv"
 	"strings"
 	"testing"
 	"testing/quick"
+	"time"
 
 	"github.com/BurntSushi/toml"
 	"github.com/pilosa/pilosa"
-	"github.com/pilosa/pilosa/httpbroadcast"
+	"github.com/pilosa/pilosa/gossip"
 	"github.com/pilosa/pilosa/server"
 	"github.com/pilosa/pilosa/test"
 )
@@ -52,7 +50,7 @@ func TestMain_Set_Quick(t *testing.T) {
 		defer m.Close()
 
 		// Create client.
-		client, err := pilosa.NewClient(m.Server.Host)
+		client, err := pilosa.NewInternalHTTPClient(m.Server.URI.HostPort(), pilosa.GetHTTPClient(nil))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -287,8 +285,8 @@ func TestMain_FrameRestore(t *testing.T) {
 
 	// Update cluster config.
 	m0.Server.Cluster.Nodes = []*pilosa.Node{
-		{Host: m0.Server.Host},
-		{Host: m1.Server.Host},
+		{Scheme: "http", Host: m0.Server.URI.HostPort()},
+		{Scheme: "http", Host: m1.Server.URI.HostPort()},
 	}
 	m1.Server.Cluster.Nodes = m0.Server.Cluster.Nodes
 
@@ -325,14 +323,14 @@ func TestMain_FrameRestore(t *testing.T) {
 	defer m2.Close()
 
 	// Import from first cluster.
-	client, err := pilosa.NewClient(m2.Server.Host)
+	client, err := pilosa.NewInternalHTTPClient(m2.Server.URI.HostPort(), pilosa.GetHTTPClient(nil))
 	if err != nil {
 		t.Fatal(err)
 	} else if err := m2.Client().CreateIndex(context.Background(), "i", pilosa.IndexOptions{}); err != nil && err != pilosa.ErrIndexExists {
 		t.Fatal(err)
 	} else if err := m2.Client().CreateFrame(context.Background(), "i", "f", pilosa.FrameOptions{}); err != nil {
 		t.Fatal(err)
-	} else if err := client.RestoreFrame(context.Background(), m0.Server.Host, "i", "f"); err != nil {
+	} else if err := client.RestoreFrame(context.Background(), m0.Server.URI.HostPort(), "i", "f"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -346,10 +344,10 @@ func TestMain_FrameRestore(t *testing.T) {
 
 // Ensure the host can be parsed.
 func TestConfig_Parse_Host(t *testing.T) {
-	if c, err := ParseConfig(`host = "local"`); err != nil {
+	if c, err := ParseConfig(`bind = "local"`); err != nil {
 		t.Fatal(err)
-	} else if c.Host != "local" {
-		t.Fatalf("unexpected host: %s", c.Host)
+	} else if c.Bind != "local" {
+		t.Fatalf("unexpected host: %s", c.Bind)
 	}
 }
 
@@ -359,18 +357,6 @@ func TestConfig_Parse_DataDir(t *testing.T) {
 		t.Fatal(err)
 	} else if c.DataDir != "/tmp/foo" {
 		t.Fatalf("unexpected data dir: %s", c.DataDir)
-	}
-}
-
-// Ensure the "plugins" config can be parsed.
-func TestConfig_Parse_Plugins(t *testing.T) {
-	if c, err := ParseConfig(`
-[plugins]
-path = "/path/to/plugins"
-`); err != nil {
-		t.Fatal(err)
-	} else if c.Plugins.Path != "/path/to/plugins" {
-		t.Fatalf("unexpected path: %s", c.Plugins.Path)
 	}
 }
 
@@ -386,78 +372,87 @@ func tempMkdir(t *testing.T) string {
 // Ensure the file handle count is working
 func TestCountOpenFiles(t *testing.T) {
 	// Windows is not supported yet
-	supported := []string{"darwin", "linux", "unix", "freebsd"}
-	sort.Strings(supported)
-	i := sort.Search(len(supported),
-		func(i int) bool { return supported[i] >= runtime.GOOS })
-	if i == len(supported) {
-		return
+	if runtime.GOOS == "windows" {
+		t.Skip("Skipping unsupported CountOpenFiles test on Windows.")
 	}
-
-	// Create directory store temp file
-	testDir := tempMkdir(t)
-	defer os.RemoveAll(testDir)
-
-	count := pilosa.CountOpenFiles()
-	testFile := filepath.Join(testDir, "test.txt")
-	_, err := os.Create(testFile)
+	count, err := pilosa.CountOpenFiles()
 	if err != nil {
-		t.Fatalf("create test file failed: %s", err)
+		t.Errorf("CountOpenFiles failed: %s", err)
 	}
-
-	if pilosa.CountOpenFiles() < count+1 {
-		t.Error("Invalid open file handle count")
+	if count == 0 {
+		t.Error("CountOpenFiles returned invalid value 0.")
 	}
 }
 
 // Ensure program can send/receive broadcast messages.
 func TestMain_SendReceiveMessage(t *testing.T) {
+
 	m0 := MustRunMain()
 	defer m0.Close()
 
 	m1 := MustRunMain()
 	defer m1.Close()
 
-	// Get available ports for internal messaging
-	freePorts, err := availablePorts(2)
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	// Update cluster config
 	m0.Server.Cluster.Nodes = []*pilosa.Node{
-		{Host: m0.Server.Host, InternalHost: "localhost:" + freePorts[0]},
-		{Host: m1.Server.Host, InternalHost: "localhost:" + freePorts[1]},
+		{Host: m0.Server.URI.HostPort()},
+		{Host: m1.Server.URI.HostPort()},
 	}
 	m1.Server.Cluster.Nodes = m0.Server.Cluster.Nodes
 
 	// Configure node0
-	m0.Server.Broadcaster = httpbroadcast.NewHTTPBroadcaster(m0.Server, freePorts[0])
-	m0.Server.Handler.Broadcaster = m0.Server.Broadcaster
-	m0.Server.Holder.Broadcaster = m0.Server.Broadcaster
-	m0.Server.BroadcastReceiver = httpbroadcast.NewHTTPBroadcastReceiver(freePorts[0], nil)
-	m0.Server.Cluster.NodeSet = httpbroadcast.NewHTTPNodeSet()
-	err = m0.Server.Cluster.NodeSet.(*httpbroadcast.HTTPNodeSet).Join(m0.Server.Cluster.Nodes)
+
+	// get the host portion of addr to use for binding
+	gossipHost := m0.Server.URI.Host()
+	gossipPort := 0
+	gossipSeed := ""
+
+	gossipNodeSet0, err := gossip.NewGossipNodeSet(m0.Server.URI.HostPort(), gossipHost, gossipPort, gossipSeed, m0.Server, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+	m0.Server.Cluster.NodeSet = gossipNodeSet0
+	m0.Server.Broadcaster = m0.Server
+	m0.Server.Gossiper = gossipNodeSet0
+	m0.Server.Handler.Broadcaster = m0.Server.Broadcaster
+	m0.Server.Holder.Broadcaster = m0.Server.Broadcaster
+	m0.Server.BroadcastReceiver = gossipNodeSet0
+
 	if err := m0.Server.BroadcastReceiver.Start(m0.Server); err != nil {
+		t.Fatal(err)
+	}
+	// Open NodeSet communication
+	if err := m0.Server.Cluster.NodeSet.Open(); err != nil {
 		t.Fatal(err)
 	}
 
 	// Configure node1
-	m1.Server.Broadcaster = httpbroadcast.NewHTTPBroadcaster(m1.Server, freePorts[1])
-	m1.Server.Handler.Broadcaster = m1.Server.Broadcaster
-	m1.Server.Holder.Broadcaster = m1.Server.Broadcaster
-	m1.Server.BroadcastReceiver = httpbroadcast.NewHTTPBroadcastReceiver(freePorts[1], nil)
-	m1.Server.Cluster.NodeSet = httpbroadcast.NewHTTPNodeSet()
-	err = m1.Server.Cluster.NodeSet.(*httpbroadcast.HTTPNodeSet).Join(m1.Server.Cluster.Nodes)
+
+	// get the host portion of addr to use for binding
+	gossipHost = m1.Server.URI.Host()
+	gossipPort = 0
+	gossipSeed = gossipNodeSet0.Seed()
+
+	gossipNodeSet1, err := gossip.NewGossipNodeSet(m1.Server.URI.HostPort(), gossipHost, gossipPort, gossipSeed, m1.Server, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+	m1.Server.Cluster.NodeSet = gossipNodeSet1
+	m1.Server.Broadcaster = m1.Server
+	m1.Server.Gossiper = gossipNodeSet1
+	m1.Server.Handler.Broadcaster = m1.Server.Broadcaster
+	m1.Server.Holder.Broadcaster = m1.Server.Broadcaster
+	m1.Server.BroadcastReceiver = gossipNodeSet1
+
 	if err := m1.Server.BroadcastReceiver.Start(m1.Server); err != nil {
 		t.Fatal(err)
 	}
+	// Open NodeSet communication
+	if err := m1.Server.Cluster.NodeSet.Open(); err != nil {
+		t.Fatal(err)
+	}
+
+	////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 	// Expected indexes and Frames
 	expected := map[string][]string{
@@ -509,11 +504,14 @@ func TestMain_SendReceiveMessage(t *testing.T) {
 
 	// Write data on first node.
 	if _, err := m0.Query("i", "", `
-			SetBit(rowID=1, frame="f", columnID=1)
-			SetBit(rowID=1, frame="f", columnID=2400000)
-		`); err != nil {
+            SetBit(rowID=1, frame="f", columnID=1)
+            SetBit(rowID=1, frame="f", columnID=2400000)
+        `); err != nil {
 		t.Fatal(err)
 	}
+
+	// We have to wait for the broadcast message to be sent before checking state.
+	time.Sleep(1 * time.Second)
 
 	// Make sure node0 knows about the latest MaxSlice.
 	maxSlices0, err := client0.MaxSliceByIndex(context.Background())
@@ -532,36 +530,32 @@ func TestMain_SendReceiveMessage(t *testing.T) {
 	if maxSlices1["i"] != 2 {
 		t.Fatalf("unexpected maxSlice on node1: %d", maxSlices1["i"])
 	}
-}
 
-// availablePorts returns a slice of ports that can be used for testing.
-func availablePorts(cnt int) ([]string, error) {
-	rtn := []string{}
-
-	for i := 0; i < cnt; i++ {
-		port, err := getPort()
-		if err != nil {
-			return nil, err
-		}
-		rtn = append(rtn, strconv.Itoa(port))
-	}
-	return rtn, nil
-}
-
-// Ask the kernel for a free open port that is ready to use
-func getPort() (int, error) {
-	addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
-	if err != nil {
-		return 0, err
+	// Write input definition to the first node.
+	if _, err := m0.CreateDefinition("i", "test", `{
+            "frames": [{"name": "event-time",
+                        "options": {
+                            "cacheType": "ranked",
+                            "timeQuantum": "YMD"
+                        }}],
+            "fields": [{"name": "columnID",
+                        "primaryKey": true
+                        }]}
+        `); err != nil {
+		t.Fatal(err)
 	}
 
-	l, err := net.ListenTCP("tcp", addr)
-	if err != nil {
-		return 0, err
-	}
-	defer l.Close()
+	// We have to wait for the broadcast message to be sent before checking state.
+	time.Sleep(1 * time.Second)
 
-	return l.Addr().(*net.TCPAddr).Port, nil
+	frame0 := m0.Server.Holder.Frame("i", "event-time")
+	if frame0 == nil {
+		t.Fatal("frame not found")
+	}
+	frame1 := m1.Server.Holder.Frame("i", "event-time")
+	if frame1 == nil {
+		t.Fatal("frame not found")
+	}
 }
 
 // Main represents a test wrapper for main.Main.
@@ -583,7 +577,8 @@ func NewMain() *Main {
 	m := &Main{Command: server.NewCommand(os.Stdin, os.Stdout, os.Stderr)}
 	m.Server.Network = *test.Network
 	m.Config.DataDir = path
-	m.Config.Host = "localhost:0"
+	m.Config.Bind = "localhost:0"
+	m.Config.Cluster.Type = "static"
 	m.Command.Stdin = &m.Stdin
 	m.Command.Stdout = &m.Stdout
 	m.Command.Stderr = &m.Stderr
@@ -636,8 +631,8 @@ func (m *Main) Reopen() error {
 func (m *Main) URL() string { return "http://" + m.Server.Addr().String() }
 
 // Client returns a client to connect to the program.
-func (m *Main) Client() *pilosa.Client {
-	client, err := pilosa.NewClient(m.Server.Host)
+func (m *Main) Client() *pilosa.InternalHTTPClient {
+	client, err := pilosa.NewInternalHTTPClient(m.Server.URI.HostPort(), pilosa.GetHTTPClient(nil))
 	if err != nil {
 		panic(err)
 	}
@@ -647,6 +642,15 @@ func (m *Main) Client() *pilosa.Client {
 // Query executes a query against the program through the HTTP API.
 func (m *Main) Query(index, rawQuery, query string) (string, error) {
 	resp := MustDo("POST", m.URL()+fmt.Sprintf("/index/%s/query?", index)+rawQuery, query)
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("invalid status: %d, body=%s", resp.StatusCode, resp.Body)
+	}
+	return resp.Body, nil
+}
+
+// CreateDefinition.
+func (m *Main) CreateDefinition(index, def, query string) (string, error) {
+	resp := MustDo("POST", m.URL()+fmt.Sprintf("/index/%s/input-definition/%s", index, def), query)
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("invalid status: %d, body=%s", resp.StatusCode, resp.Body)
 	}

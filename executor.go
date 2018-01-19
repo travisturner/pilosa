@@ -15,17 +15,13 @@
 package pilosa
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"net/http"
-	"net/url"
 	"sort"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
 	"github.com/pilosa/pilosa/internal"
 	"github.com/pilosa/pilosa/pql"
 )
@@ -44,20 +40,21 @@ type Executor struct {
 	Holder *Holder
 
 	// Local hostname & cluster configuration.
+	Scheme  string
 	Host    string
 	Cluster *Cluster
 
-	// Client used for remote HTTP requests.
-	HTTPClient *http.Client
+	// Client used for remote requests.
+	client InternalClient
 
 	// Maximum number of SetBit() or ClearBit() commands per request.
 	MaxWritesPerRequest int
 }
 
 // NewExecutor returns a new instance of Executor.
-func NewExecutor() *Executor {
+func NewExecutor(remoteClient *http.Client) *Executor {
 	return &Executor{
-		HTTPClient: http.DefaultClient,
+		client: NewInternalHTTPClientFromURI(nil, remoteClient),
 	}
 }
 
@@ -92,8 +89,12 @@ func (e *Executor) Execute(ctx context.Context, index string, q *pql.Query, slic
 		// Determine slices and inverseSlices for use in e.executeCall().
 		if needsSlices {
 			// Round up the number of slices.
-			maxSlice := e.Holder.Index(index).MaxSlice()
-			maxInverseSlice := e.Holder.Index(index).MaxInverseSlice()
+			idx := e.Holder.Index(index)
+			if idx == nil {
+				return nil, ErrIndexNotFound
+			}
+			maxSlice := idx.MaxSlice()
+			maxInverseSlice := idx.MaxInverseSlice()
 
 			// Generate a slices of all slices.
 			slices = make([]uint64, maxSlice+1)
@@ -108,10 +109,6 @@ func (e *Executor) Execute(ctx context.Context, index string, q *pql.Query, slic
 			}
 
 			// Fetch column label from index.
-			idx := e.Holder.Index(index)
-			if idx == nil {
-				return nil, ErrIndexNotFound
-			}
 			columnLabel = idx.ColumnLabel()
 		}
 	}
@@ -161,6 +158,9 @@ func (e *Executor) executeCall(ctx context.Context, index string, c *pql.Call, s
 	indexTag := fmt.Sprintf("index:%s", index)
 	// Special handling for mutation and top-n calls.
 	switch c.Name {
+	case "Sum":
+		e.Holder.Stats.CountWithCustomTags(c.Name, 1, 1.0, []string{indexTag})
+		return e.executeSum(ctx, index, c, slices, opt)
 	case "ClearBit":
 		return e.executeClearBit(ctx, index, c, opt)
 	case "Count":
@@ -168,6 +168,8 @@ func (e *Executor) executeCall(ctx context.Context, index string, c *pql.Call, s
 		return e.executeCount(ctx, index, c, slices, opt)
 	case "SetBit":
 		return e.executeSetBit(ctx, index, c, opt)
+	case "SetFieldValue":
+		return nil, e.executeSetFieldValue(ctx, index, c, opt)
 	case "SetRowAttrs":
 		return nil, e.executeSetRowAttrs(ctx, index, c, opt)
 	case "SetColumnAttrs":
@@ -200,6 +202,41 @@ func (e *Executor) validateCallArgs(c *pql.Call) error {
 	return nil
 }
 
+// executeSum executes a Sum() call.
+func (e *Executor) executeSum(ctx context.Context, index string, c *pql.Call, slices []uint64, opt *ExecOptions) (SumCount, error) {
+	if frame, _ := c.Args["frame"]; frame == "" {
+		return SumCount{}, errors.New("Sum(): frame required")
+	} else if field, _ := c.Args["field"]; field == "" {
+		return SumCount{}, errors.New("Sum(): field required")
+	}
+
+	if len(c.Children) > 1 {
+		return SumCount{}, errors.New("Sum() only accepts a single bitmap input")
+	}
+
+	// Execute calls in bulk on each remote node and merge.
+	mapFn := func(slice uint64) (interface{}, error) {
+		return e.executeSumCountSlice(ctx, index, c, slice)
+	}
+
+	// Merge returned results at coordinating node.
+	reduceFn := func(prev, v interface{}) interface{} {
+		other, _ := prev.(SumCount)
+		return other.Add(v.(SumCount))
+	}
+
+	result, err := e.mapReduce(ctx, index, slices, c, opt, mapFn, reduceFn)
+	if err != nil {
+		return SumCount{}, err
+	}
+	other, _ := result.(SumCount)
+
+	if other.Count == 0 {
+		return SumCount{}, nil
+	}
+	return other, nil
+}
+
 // executeBitmapCall executes a call that returns a bitmap.
 func (e *Executor) executeBitmapCall(ctx context.Context, index string, c *pql.Call, slices []uint64, opt *ExecOptions) (*Bitmap, error) {
 	// Execute calls in bulk on each remote node and merge.
@@ -227,34 +264,41 @@ func (e *Executor) executeBitmapCall(ctx context.Context, index string, c *pql.C
 	// If the row label is used then return bitmap attributes.
 	bm, _ := other.(*Bitmap)
 	if c.Name == "Bitmap" {
-
-		idx := e.Holder.Index(index)
-		if idx != nil {
-			columnLabel := idx.ColumnLabel()
-			if columnID, ok, err := c.UintArg(columnLabel); ok && err == nil {
-				attrs, err := idx.ColumnAttrStore().Attrs(columnID)
-				if err != nil {
-					return nil, err
-				}
-				bm.Attrs = attrs
-			} else if err != nil {
-				return nil, err
-			} else {
-				frame, _ := c.Args["frame"].(string)
-				if fr := idx.Frame(frame); fr != nil {
-					rowLabel := fr.RowLabel()
-					rowID, _, err := c.UintArg(rowLabel)
-					if err != nil {
-						return nil, err
-					}
-					attrs, err := fr.RowAttrStore().Attrs(rowID)
+		if opt.ExcludeAttrs {
+			bm.Attrs = map[string]interface{}{}
+		} else {
+			idx := e.Holder.Index(index)
+			if idx != nil {
+				columnLabel := idx.ColumnLabel()
+				if columnID, ok, err := c.UintArg(columnLabel); ok && err == nil {
+					attrs, err := idx.ColumnAttrStore().Attrs(columnID)
 					if err != nil {
 						return nil, err
 					}
 					bm.Attrs = attrs
+				} else if err != nil {
+					return nil, err
+				} else {
+					frame, _ := c.Args["frame"].(string)
+					if fr := idx.Frame(frame); fr != nil {
+						rowLabel := fr.RowLabel()
+						rowID, _, err := c.UintArg(rowLabel)
+						if err != nil {
+							return nil, err
+						}
+						attrs, err := fr.RowAttrStore().Attrs(rowID)
+						if err != nil {
+							return nil, err
+						}
+						bm.Attrs = attrs
+					}
 				}
 			}
 		}
+	}
+
+	if opt.ExcludeBits {
+		bm.segments = []BitmapSegment{}
 	}
 
 	return bm, nil
@@ -273,9 +317,50 @@ func (e *Executor) executeBitmapCallSlice(ctx context.Context, index string, c *
 		return e.executeRangeSlice(ctx, index, c, slice)
 	case "Union":
 		return e.executeUnionSlice(ctx, index, c, slice)
+	case "Xor":
+		return e.executeXorSlice(ctx, index, c, slice)
 	default:
 		return nil, fmt.Errorf("unknown call: %s", c.Name)
 	}
+}
+
+// executeSumCountSlice executes calculates the sum & count for fields on a slice.
+func (e *Executor) executeSumCountSlice(ctx context.Context, index string, c *pql.Call, slice uint64) (SumCount, error) {
+	var filter *Bitmap
+	if len(c.Children) == 1 {
+		bm, err := e.executeBitmapCallSlice(ctx, index, c.Children[0], slice)
+		if err != nil {
+			return SumCount{}, err
+		}
+		filter = bm
+	}
+
+	frameName, _ := c.Args["frame"].(string)
+	fieldName, _ := c.Args["field"].(string)
+
+	frame := e.Holder.Frame(index, frameName)
+	if frame == nil {
+		return SumCount{}, nil
+	}
+
+	field := frame.Field(fieldName)
+	if field == nil {
+		return SumCount{}, nil
+	}
+
+	view := e.Holder.Fragment(index, frameName, ViewFieldPrefix+fieldName, slice)
+	if view == nil {
+		return SumCount{}, nil
+	}
+
+	vsum, vcount, err := view.FieldSum(filter, field.BitDepth())
+	if err != nil {
+		return SumCount{}, err
+	}
+	return SumCount{
+		Sum:   int64(vsum) + (int64(vcount) * field.Min),
+		Count: int64(vcount),
+	}, nil
 }
 
 // executeTopN executes a TopN() call.
@@ -506,6 +591,11 @@ func (e *Executor) executeIntersectSlice(ctx context.Context, index string, c *p
 
 // executeRangeSlice executes a range() call for a local slice.
 func (e *Executor) executeRangeSlice(ctx context.Context, index string, c *pql.Call, slice uint64) (*Bitmap, error) {
+	// Handle field ranges differently.
+	if c.HasConditionArg() {
+		return e.executeFieldRangeSlice(ctx, index, c, slice)
+	}
+
 	// Parse frame, use default if unset.
 	frame, _ := c.Args["frame"].(string)
 	if frame == "" {
@@ -560,7 +650,7 @@ func (e *Executor) executeRangeSlice(ctx context.Context, index string, c *pql.C
 	}
 
 	// Parse end time.
-	endTimeStr, _ := c.Args["end"].(string)
+	endTimeStr, ok := c.Args["end"].(string)
 	if !ok {
 		return nil, errors.New("Range() end time required")
 	}
@@ -588,6 +678,145 @@ func (e *Executor) executeRangeSlice(ctx context.Context, index string, c *pql.C
 	return bm, nil
 }
 
+// executeFieldRangeSlice executes a range(field) call for a local slice.
+func (e *Executor) executeFieldRangeSlice(ctx context.Context, index string, c *pql.Call, slice uint64) (*Bitmap, error) {
+	// Parse frame, use default if unset.
+	frame, _ := c.Args["frame"].(string)
+	if frame == "" {
+		frame = DefaultFrame
+	}
+	f := e.Holder.Frame(index, frame)
+	if f == nil {
+		return nil, ErrFrameNotFound
+	}
+
+	// Remove frame field.
+	args := pql.CopyArgs(c.Args)
+	delete(args, "frame")
+
+	// Only one conditional field should remain.
+	if len(args) == 0 {
+		return nil, errors.New("Range(): condition required")
+	} else if len(args) > 1 {
+		return nil, errors.New("Range(): too many arguments")
+	}
+
+	// Extract condition field.
+	var fieldName string
+	var cond *pql.Condition
+	for k, v := range args {
+		vv, ok := v.(*pql.Condition)
+		if !ok {
+			return nil, fmt.Errorf("Range(): %q: expected condition argument, got %v", k, v)
+		}
+		fieldName, cond = k, vv
+	}
+
+	// EQ null           (not implemented: flip frag.FieldNotNull with max ColumnID)
+	// NEQ null          frag.FieldNotNull()
+	// BETWEEN a,b(in)   BETWEEN/frag.FieldRangeBetween()
+	// BETWEEN a,b(out)  BETWEEN/frag.FieldNotNull()
+	// EQ <int>          frag.FieldRange
+	// NEQ <int>         frag.FieldRange
+
+	// Handle `!= null`.
+	if cond.Op == pql.NEQ && cond.Value == nil {
+		// Find field.
+		field := f.Field(fieldName)
+		if field == nil {
+			return nil, ErrFieldNotFound
+		}
+
+		// Retrieve fragment.
+		frag := e.Holder.Fragment(index, frame, ViewFieldPrefix+fieldName, slice)
+		if frag == nil {
+			return NewBitmap(), nil
+		}
+
+		return frag.FieldNotNull(field.BitDepth())
+
+	} else if cond.Op == pql.BETWEEN {
+
+		predicates, err := cond.IntSliceValue()
+		if err != nil {
+			return nil, err
+		}
+
+		// Only support two integers for the between operation.
+		if len(predicates) != 2 {
+			return nil, errors.New("Range(): BETWEEN condition requires exactly two integer values")
+		}
+
+		// The reason we don't just call:
+		//     return f.FieldRangeBetween(fieldName, predicates[0], predicates[1])
+		// here is because we need the call to be slice-specific.
+
+		// Find field.
+		field := f.Field(fieldName)
+		if field == nil {
+			return nil, ErrFieldNotFound
+		}
+
+		baseValueMin, baseValueMax, outOfRange := field.BaseValueBetween(predicates[0], predicates[1])
+		if outOfRange {
+			return NewBitmap(), nil
+		}
+
+		// Retrieve fragment.
+		frag := e.Holder.Fragment(index, frame, ViewFieldPrefix+fieldName, slice)
+		if frag == nil {
+			return NewBitmap(), nil
+		}
+
+		// If the query is asking for the entire valid range, just return
+		// the not-null bitmap for the field.
+		if predicates[0] <= field.Min && predicates[1] >= field.Max {
+			return frag.FieldNotNull(field.BitDepth())
+		}
+
+		return frag.FieldRangeBetween(field.BitDepth(), baseValueMin, baseValueMax)
+
+	} else {
+
+		// Only support integers for now.
+		value, ok := cond.Value.(int64)
+		if !ok {
+			return nil, errors.New("Range(): conditions only support integer values")
+		}
+
+		// Find field.
+		field := f.Field(fieldName)
+		if field == nil {
+			return nil, ErrFieldNotFound
+		}
+
+		baseValue, outOfRange := field.BaseValue(cond.Op, value)
+		if outOfRange && cond.Op != pql.NEQ {
+			return NewBitmap(), nil
+		}
+
+		// Retrieve fragment.
+		frag := e.Holder.Fragment(index, frame, ViewFieldPrefix+fieldName, slice)
+		if frag == nil {
+			return NewBitmap(), nil
+		}
+
+		// LT[E] and GT[E] should return all not-null if selected range fully encompases valid field range.
+		if (cond.Op == pql.LT && value > field.Max) || (cond.Op == pql.LTE && value >= field.Max) ||
+			(cond.Op == pql.GT && value < field.Min) || (cond.Op == pql.GTE && value <= field.Min) {
+			return frag.FieldNotNull(field.BitDepth())
+		}
+
+		// outOfRange for NEQ should return all not-null.
+		if outOfRange && cond.Op == pql.NEQ {
+			return frag.FieldNotNull(field.BitDepth())
+		}
+
+		f.Stats.Count("range:field", 1, 1.0)
+		return frag.FieldRange(cond.Op, field.BitDepth(), baseValue)
+	}
+}
+
 // executeUnionSlice executes a union() call for a local slice.
 func (e *Executor) executeUnionSlice(ctx context.Context, index string, c *pql.Call, slice uint64) (*Bitmap, error) {
 	other := NewBitmap()
@@ -601,6 +830,25 @@ func (e *Executor) executeUnionSlice(ctx context.Context, index string, c *pql.C
 			other = bm
 		} else {
 			other = other.Union(bm)
+		}
+	}
+	other.InvalidateCount()
+	return other, nil
+}
+
+// executeXorSlice executes a xor() call for a local slice.
+func (e *Executor) executeXorSlice(ctx context.Context, index string, c *pql.Call, slice uint64) (*Bitmap, error) {
+	other := NewBitmap()
+	for i, input := range c.Children {
+		bm, err := e.executeBitmapCallSlice(ctx, index, input, slice)
+		if err != nil {
+			return nil, err
+		}
+
+		if i == 0 {
+			other = bm
+		} else {
+			other = other.Xor(bm)
 		}
 	}
 	other.InvalidateCount()
@@ -724,7 +972,7 @@ func (e *Executor) executeClearBitView(ctx context.Context, index string, c *pql
 		}
 
 		// Forward call to remote node otherwise.
-		if res, err := e.exec(ctx, node, index, &pql.Query{Calls: []*pql.Call{c}}, nil, opt); err != nil {
+		if res, err := e.remoteExec(ctx, node, index, &pql.Query{Calls: []*pql.Call{c}}, nil, opt); err != nil {
 			return false, err
 		} else {
 			ret = res[0].(bool)
@@ -830,13 +1078,86 @@ func (e *Executor) executeSetBitView(ctx context.Context, index string, c *pql.C
 		}
 
 		// Forward call to remote node otherwise.
-		if res, err := e.exec(ctx, node, index, &pql.Query{Calls: []*pql.Call{c}}, nil, opt); err != nil {
+		if res, err := e.remoteExec(ctx, node, index, &pql.Query{Calls: []*pql.Call{c}}, nil, opt); err != nil {
 			return false, err
 		} else {
 			ret = res[0].(bool)
 		}
 	}
 	return ret, nil
+}
+
+// executeSetFieldValue executes a SetFieldValue() call.
+func (e *Executor) executeSetFieldValue(ctx context.Context, index string, c *pql.Call, opt *ExecOptions) error {
+	frameName, ok := c.Args["frame"].(string)
+	if !ok {
+		return errors.New("SetFieldValue() frame required")
+	}
+
+	// Retrieve column label.
+	idx := e.Holder.Index(index)
+	if idx == nil {
+		return ErrIndexNotFound
+	}
+	columnLabel := idx.ColumnLabel()
+
+	// Retrieve frame.
+	frame := e.Holder.Frame(index, frameName)
+	if frame == nil {
+		return ErrFrameNotFound
+	}
+
+	// Parse labels.
+	columnID, ok, err := c.UintArg(columnLabel)
+	if err != nil {
+		return fmt.Errorf("reading SetFieldValue() column: %v", err)
+	} else if !ok {
+		return fmt.Errorf("SetFieldValue() column field '%v' required", columnLabel)
+	}
+
+	// Copy args and remove reserved fields.
+	args := pql.CopyArgs(c.Args)
+	delete(args, "frame")
+	// While frame could technically work as a ColumnAttr argument, we are treating it as a reserved word primarily to avoid confusion.
+	// Also, if we ever need to make ColumnAttrs frame-specific, then having this reserved word prevents backward incompatibility.
+	delete(args, columnLabel)
+
+	// Set values.
+	for name, value := range args {
+		switch value := value.(type) {
+		case int64:
+			if _, err := frame.SetFieldValue(columnID, name, value); err != nil {
+				return err
+			}
+		default:
+			return ErrInvalidFieldValueType
+		}
+	}
+	frame.Stats.Count("SetFieldValue", 1, 1.0)
+
+	// Do not forward call if this is already being forwarded.
+	if opt.Remote {
+		return nil
+	}
+
+	// Execute on remote nodes in parallel.
+	nodes := Nodes(e.Cluster.Nodes).FilterHost(e.Host)
+	resp := make(chan error, len(nodes))
+	for _, node := range nodes {
+		go func(node *Node) {
+			_, err := e.remoteExec(ctx, node, index, &pql.Query{Calls: []*pql.Call{c}}, nil, opt)
+			resp <- err
+		}(node)
+	}
+
+	// Return first error.
+	for range nodes {
+		if err := <-resp; err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // executeSetRowAttrs executes a SetRowAttrs() call.
@@ -882,7 +1203,7 @@ func (e *Executor) executeSetRowAttrs(ctx context.Context, index string, c *pql.
 	resp := make(chan error, len(nodes))
 	for _, node := range nodes {
 		go func(node *Node) {
-			_, err := e.exec(ctx, node, index, &pql.Query{Calls: []*pql.Call{c}}, nil, opt)
+			_, err := e.remoteExec(ctx, node, index, &pql.Query{Calls: []*pql.Call{c}}, nil, opt)
 			resp <- err
 		}(node)
 	}
@@ -969,7 +1290,7 @@ func (e *Executor) executeBulkSetRowAttrs(ctx context.Context, index string, cal
 	resp := make(chan error, len(nodes))
 	for _, node := range nodes {
 		go func(node *Node) {
-			_, err := e.exec(ctx, node, index, &pql.Query{Calls: calls}, nil, opt)
+			_, err := e.remoteExec(ctx, node, index, &pql.Query{Calls: calls}, nil, opt)
 			resp <- err
 		}(node)
 	}
@@ -1011,6 +1332,7 @@ func (e *Executor) executeSetColumnAttrs(ctx context.Context, index string, c *p
 	// Copy args and remove reserved fields.
 	attrs := pql.CopyArgs(c.Args)
 	delete(attrs, colName)
+	delete(attrs, "frame")
 
 	// Set attributes.
 	if err := idx.ColumnAttrStore().SetAttrs(id, attrs); err != nil {
@@ -1027,7 +1349,7 @@ func (e *Executor) executeSetColumnAttrs(ctx context.Context, index string, c *p
 	resp := make(chan error, len(nodes))
 	for _, node := range nodes {
 		go func(node *Node) {
-			_, err := e.exec(ctx, node, index, &pql.Query{Calls: []*pql.Call{c}}, nil, opt)
+			_, err := e.remoteExec(ctx, node, index, &pql.Query{Calls: []*pql.Call{c}}, nil, opt)
 			resp <- err
 		}(node)
 	}
@@ -1043,54 +1365,21 @@ func (e *Executor) executeSetColumnAttrs(ctx context.Context, index string, c *p
 }
 
 // exec executes a PQL query remotely for a set of slices on a node.
-func (e *Executor) exec(ctx context.Context, node *Node, index string, q *pql.Query, slices []uint64, opt *ExecOptions) (results []interface{}, err error) {
+func (e *Executor) remoteExec(ctx context.Context, node *Node, index string, q *pql.Query, slices []uint64, opt *ExecOptions) (results []interface{}, err error) {
 	// Encode request object.
 	pbreq := &internal.QueryRequest{
 		Query:  q.String(),
 		Slices: slices,
 		Remote: true,
 	}
-	buf, err := proto.Marshal(pbreq)
+	uri, err := NewURIFromAddress(node.Host)
 	if err != nil {
 		return nil, err
 	}
-
-	// Create HTTP request.
-	req, err := http.NewRequest("POST", (&url.URL{
-		Scheme: "http",
-		Host:   node.Host,
-		Path:   fmt.Sprintf("/index/%s/query", index),
-	}).String(), bytes.NewReader(buf))
+	uri.SetScheme(node.Scheme)
+	ctx = context.WithValue(ctx, "uri", uri)
+	pb, err := e.client.ExecuteQuery(ctx, index, pbreq)
 	if err != nil {
-		return nil, err
-	}
-
-	// Require protobuf encoding.
-	req.Header.Set("Accept", "application/x-protobuf")
-	req.Header.Set("Content-Type", "application/x-protobuf")
-	req.Header.Set("User-Agent", "pilosa/"+Version)
-
-	// Send request to remote node.
-	resp, err := e.HTTPClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	// Read response into buffer.
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	// Check status code.
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("invalid status Executor.exec: code=%d, err=%s, req: %v", resp.StatusCode, body, req)
-	}
-
-	// Decode response object.
-	var pb internal.QueryResponse
-	if err := proto.Unmarshal(body, &pb); err != nil {
 		return nil, err
 	}
 
@@ -1106,6 +1395,8 @@ func (e *Executor) exec(ctx context.Context, node *Node, index string, q *pql.Qu
 		var err error
 
 		switch call.Name {
+		case "Average", "Sum":
+			v, err = decodeSumCount(pb.Results[i].GetSumCount()), nil
 		case "TopN":
 			v, err = decodePairs(pb.Results[i].GetPairs()), nil
 		case "Count":
@@ -1224,8 +1515,7 @@ func (e *Executor) mapper(ctx context.Context, ch chan mapResponse, nodes []*Nod
 			if n.Host == e.Host {
 				resp.result, resp.err = e.mapperLocal(ctx, nodeSlices, mapFn, reduceFn)
 			} else if !opt.Remote {
-
-				results, err := e.exec(ctx, n, index, &pql.Query{Calls: []*pql.Call{c}}, nodeSlices, opt)
+				results, err := e.remoteExec(ctx, n, index, &pql.Query{Calls: []*pql.Call{c}}, nodeSlices, opt)
 				if len(results) > 0 {
 					resp.result = results[0]
 				}
@@ -1298,7 +1588,9 @@ type mapResponse struct {
 
 // ExecOptions represents an execution context for a single Execute() call.
 type ExecOptions struct {
-	Remote bool
+	Remote       bool
+	ExcludeAttrs bool
+	ExcludeBits  bool
 }
 
 // decodeError returns an error representation of s if s is non-blank.
@@ -1340,4 +1632,31 @@ func needsSlices(calls []*pql.Call) bool {
 		}
 	}
 	return false
+}
+
+// SumCount represents a grouping of sum & count for Sum() and Average() calls.
+type SumCount struct {
+	Sum   int64 `json:"sum"`
+	Count int64 `json:"count"`
+}
+
+func (sc *SumCount) Add(other SumCount) SumCount {
+	return SumCount{
+		Sum:   sc.Sum + other.Sum,
+		Count: sc.Count + other.Count,
+	}
+}
+
+func encodeSumCount(sc SumCount) *internal.SumCount {
+	return &internal.SumCount{
+		Sum:   sc.Sum,
+		Count: sc.Count,
+	}
+}
+
+func decodeSumCount(pb *internal.SumCount) SumCount {
+	return SumCount{
+		Sum:   pb.Sum,
+		Count: pb.Count,
+	}
 }

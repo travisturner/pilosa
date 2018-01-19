@@ -1,5 +1,12 @@
 +++
-title = "Administration Guide"
+title = "Administration"
+weight = 13
+nav = [
+    "Installing in production",
+    "Importing and Exporting Data",
+    "Versioning",
+    "Backup/restore",
+]
 +++
 
 ## Administration Guide
@@ -30,6 +37,12 @@ Pilosa is designed to be a distributed application, with data replication shared
 
 While Pilosa does have some high system requirements it is not a best practice to set up a cluster with the fewest, largest machines available.  You want an evenly distributed load across several nodes in a cluster to easily recover from a single node failure, and have the resource capacity to handle a missing node until it's repaired or replaced.   Nor is it advisable to have many small machines.  The internode network traffic will become a bottleneck.  You can always add nodes later, but that does require some down time.
 
+### Open File Limits
+
+Pilosa requires a large number of open files to support its memory-mapped file storage system. Most operating systems put limits on the maximum number of files that may be opened concurrently by a process. On Linux systems, this limit is controlled by a utility called [ulimit](https://ss64.com/bash/ulimit.html). Pilosa will automatically attempt to raise the limit to `262144` during startup, but it may fail due to access limitations. If you see errors related to open file limits when starting Pilosa, it is recommended that you run `sudo ulimit -n 262144` before starting Pilosa.
+
+On Mac OS X, `ulimit` does not behave predictably. [This blog post](https://blog.dekstroza.io/ulimit-shenanigans-on-osx-el-capitan/) contains information about setting open file limits in OS X.
+
 ### Importing and Exporting Data
 
 #### Importing
@@ -39,8 +52,20 @@ The import API expects a csv of RowID,ColumnID's.
 When importing large datasets remember it is much faster to pre sort the data by RowID and then by ColumnID in ascending order. You can use the `--sort` flag to do that. Also, avoid querying Pilosa until the import is complete, otherwise you will experience inconsistent results.
 
 ```
-pilosa import --sort -d project -f stargazer project-stargazer.csv
+pilosa import --sort -i project -f stargazer project-stargazer.csv
 ```
+
+##### Importing Field Values
+
+If you are using [BSI Range-Encoding](../data-model/#bsi-range-encoding) field values, you can import field values for a single frame and single field using `--field`. The CSV file should be in the format `ColumnID,Value`.
+
+```
+pilosa import -i project -f stargazer --field star_count project-stargazer-counts.csv
+```
+
+<div class="note">
+    <p>Note that you must first create a frame with Range Encoding enabled and a field. View <a href="../api-reference/#create-frame">Create Frame</a> for more details.</p>
+</div>
 
 #### Exporting
 
@@ -99,6 +124,27 @@ Note: This will only work when the replication factor is >= 2
 - Restart the cluster
 - Wait for the 1st sync (10 minutes) to validate Index connections
 
+#### Diagnostics
+
+Each Pilosa cluster is configured by default to share anonymous usage details with Pilosa Corp. These metrics allow us to understand how Pilosa is used by the community and improve the technology to suit your needs. Diagnostics are sent to Pilosa every hour. Each of the metrics are detailed below as well as opt-out instructions.
+
+- **Version:** Version string of the build.
+- **Host:** Host URI.
+- **Cluster:** List of nodes in the Cluster.
+- **NumNodes:** Number of nodes in the Cluster.
+- **NumCPU:** Number of Cores per Node
+- **BSIEnabled:** Bit Slice Index Frames in use.
+- **TimeQuantumEnabled:** Time Quantum Frames in use.
+- **InverseEnabled:** Inverse Frames in use.
+- **NumIndexes:** Number of Indexes in the Cluster.
+- **NumFrames:** Number of Frames in the Cluster.
+- **NumSlices:** Number of Slices in the Cluster.
+- **NumViews:** Number of Views in the Cluster.
+- **OpenFiles:** Open file handle count.
+- **GoRoutines:** Go routine count.
+ 
+You can opt-out of the Pilosa diagnostics reporting by setting either the command line configuration option `--metric.diagnostics=false`, use the `PILOSA_METRIC_DIAGNOSTICS` environment variable, or the TOML configuration file `[metric]` `diagnostics` option.
+
 #### Metrics
 
 Pilosa can be configured to emit metrics pertaining to its internal processes in one of two formats: Expvar or StatsD. Metric recording is disabled by default.
@@ -120,42 +166,23 @@ StatsD Tags adhere to the DataDog format (key:value), and we tag the following:
 ##### Events
 We currently track the following events
 
-<strong id="index">Index:</strong> The creation of a new Index.
-
-<strong id="frame">Frame:</strong> The creation of a new Frame.
-
-<strong id="maxSlice">MaxSlice:</strong> The Creation of a new Slice.
-
-<strong id="setbit">SetBit:</strong> Count of set bits.
-
-<strong id="clearbit">ClearBit:</strong> Count of cleared bits.
-
-<strong id="importbit">ImportBit:</strong> During a bulk data import this represents the count of bits created.
-
-<strong id="setrowattrs">SetRowAttrs:</strong> Count of Attributes set per row.
-
-<strong id="setcollumnattrs">SetColumnAttrs:</strong> Count of Attributes set per collumn.
-
-<strong id="bitmap">Bitmap:</strong> Count of Bitmap queries.
-
-<strong id="topn">TopN:</strong> Count of TopN queries.
-
-<strong id="union">Union:</strong> Count of Union queries.
-
-<strong id="intersection">Intersection:</strong> Count of Intersection queries.
-
-<strong id="difference">Difference:</strong> Count of Difference queries.
-
-<strong id="count">Count:</strong> Count of Count queries.
-
-<strong id="range">Range:</strong> Count of Range queries.
-
-<strong id="snapshot">Snapshot:</strong> Event count when the snapshot process is triggered.
-
-<strong id="blockrepair">BlockRepair:</strong> Count of data blocks that were out of sync and repaired.
-
-<strong id="garbage_collection">Garbage Collection:</strong> Event count when Garbage Collection occurs.
-
-<strong id="goroutines">Goroutines:</strong> Number of running Goroutines.
-
-<strong id="openfiles">OpenFiles:</strong> Number of open file handles associated with running Pilosa process ID.
+- **Index:** The creation of a new Index.
+- **Frame:** The creation of a new Frame.
+- **MaxSlice:** The Creation of a new Slice.
+- **SetBit:** Count of set bits.
+- **ClearBit:** Count of cleared bits.
+- **ImportBit:** During a bulk data import this represents the count of bits created.
+- **SetRowAttrs:** Count of Attributes set per row.
+- **SetColumnAttrs:** Count of Attributes set per collumn.
+- **Bitmap:** Count of Bitmap queries.
+- **TopN:** Count of TopN queries.
+- **Union:** Count of Union queries.
+- **Intersection:** Count of Intersection queries.
+- **Difference:** Count of Difference queries.
+- **Count:** Count of Count queries.
+- **Range:** Count of Range queries.
+- **Snapshot:** Event count when the snapshot process is triggered.
+- **BlockRepair:** Count of data blocks that were out of sync and repaired.
+- **Garbage Collection:** Event count when Garbage Collection occurs.
+- **Goroutines:** Number of running Goroutines.
+- **OpenFiles:** Number of open file handles associated with running Pilosa process ID.

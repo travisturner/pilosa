@@ -16,13 +16,15 @@ package ctl
 
 import (
 	"bytes"
-	"github.com/pilosa/pilosa"
-	"golang.org/x/net/context"
+	"context"
 	"io"
 	"io/ioutil"
 	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/pilosa/pilosa"
+	"github.com/pilosa/pilosa/test"
 )
 
 func TestImportCommand_Validation(t *testing.T) {
@@ -59,12 +61,56 @@ func TestImportCommand_Run(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	hldr := MustOpenHolder()
+	hldr := test.MustOpenHolder()
 	defer hldr.Close()
-	s := NewServer()
+	s := test.NewServer()
 	defer s.Close()
-	s.Handler.Host = s.Host()
-	s.Handler.Cluster = NewCluster(1)
+	uri, err := pilosa.NewURIFromAddress(s.Host())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Handler.URI = uri
+	s.Handler.Cluster = test.NewCluster(1)
+	s.Handler.Cluster.Nodes[0].Host = s.Host()
+	s.Handler.Holder = hldr.Holder
+	cm.Host = s.Host()
+
+	cm.Index = "i"
+	cm.Frame = "f"
+	cm.CreateSchema = true
+	cm.Paths = []string{file.Name()}
+	err = cm.Run(ctx)
+	if err != nil {
+		t.Fatalf("Import Run doesn't work: %s", err)
+	}
+}
+
+// Ensure that the ImportValue path runs (note: we have specifed a value
+// for cm.Field. Because the handler doesn't return errors (it sends them
+// to the logger), we don't get an error returned at `cm.Run()` even though
+// we haven't setup frame `f` to be RangeEnabled.
+func TestImportCommand_RunValue(t *testing.T) {
+
+	buf := bytes.Buffer{}
+	stdin, stdout, stderr := GetIO(buf)
+	cm := NewImportCommand(stdin, stdout, stderr)
+	file, err := ioutil.TempFile("", "import-value.csv")
+	file.Write([]byte("1,2\n3,4\n5,6"))
+	ctx := context.Background()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hldr := test.MustOpenHolder()
+	defer hldr.Close()
+	s := test.NewServer()
+	defer s.Close()
+	uri, err := pilosa.NewURIFromAddress(s.Host())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Handler.URI = uri
+	s.Handler.Cluster = test.NewCluster(1)
 	s.Handler.Cluster.Nodes[0].Host = s.Host()
 	s.Handler.Holder = hldr.Holder
 	cm.Host = s.Host()
@@ -74,10 +120,11 @@ func TestImportCommand_Run(t *testing.T) {
 
 	cm.Index = "i"
 	cm.Frame = "f"
+	cm.Field = "foo"
 	cm.Paths = []string{file.Name()}
 	err = cm.Run(ctx)
 	if err != nil {
-		t.Fatalf("Import Run doesn't work: %s", err)
+		t.Fatalf("Import Run with values doesn't work: %s", err)
 	}
 }
 

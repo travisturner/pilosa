@@ -25,12 +25,15 @@ import (
 	"sync"
 
 	"github.com/pilosa/pilosa/internal"
+	"github.com/pilosa/pilosa/pql"
 )
 
 // View layout modes.
 const (
 	ViewStandard = "standard"
 	ViewInverse  = "inverse"
+
+	ViewFieldPrefix = "field_"
 )
 
 // IsValidView returns true if name is valid.
@@ -40,7 +43,7 @@ func IsValidView(name string) bool {
 
 // View represents a container for frame data.
 type View struct {
-	mu    sync.Mutex
+	mu    sync.RWMutex
 	path  string
 	index string
 	frame string
@@ -160,7 +163,9 @@ func (v *View) Close() error {
 
 	// Close all fragments.
 	for _, frag := range v.fragments {
-		_ = frag.Close()
+		if err := frag.Close(); err != nil {
+			return err
+		}
 	}
 	v.fragments = make(map[uint64]*Fragment)
 
@@ -169,8 +174,8 @@ func (v *View) Close() error {
 
 // MaxSlice returns the max slice in the view.
 func (v *View) MaxSlice() uint64 {
-	v.mu.Lock()
-	defer v.mu.Unlock()
+	v.mu.RLock()
+	defer v.mu.RUnlock()
 
 	var max uint64
 	for slice := range v.fragments {
@@ -189,8 +194,8 @@ func (v *View) FragmentPath(slice uint64) string {
 
 // Fragment returns a fragment in the view by slice.
 func (v *View) Fragment(slice uint64) *Fragment {
-	v.mu.Lock()
-	defer v.mu.Unlock()
+	v.mu.RLock()
+	defer v.mu.RUnlock()
 	return v.fragment(slice)
 }
 
@@ -206,6 +211,13 @@ func (v *View) Fragments() []*Fragment {
 		other = append(other, fragment)
 	}
 	return other
+}
+
+// RecalculateCaches recalculates the cache on every fragment in the view.
+func (v *View) RecalculateCaches() {
+	for _, fragment := range v.Fragments() {
+		fragment.RecalculateCache()
+	}
 }
 
 // CreateFragmentIfNotExists returns a fragment in the view by slice.
@@ -276,6 +288,66 @@ func (v *View) ClearBit(rowID, columnID uint64) (changed bool, err error) {
 		return changed, err
 	}
 	return frag.ClearBit(rowID, columnID)
+}
+
+// FieldValue uses a column of bits to read a multi-bit value.
+func (v *View) FieldValue(columnID uint64, bitDepth uint) (value uint64, exists bool, err error) {
+	slice := columnID / SliceWidth
+	frag, err := v.CreateFragmentIfNotExists(slice)
+	if err != nil {
+		return value, exists, err
+	}
+	return frag.FieldValue(columnID, bitDepth)
+}
+
+// SetFieldValue uses a column of bits to set a multi-bit value.
+func (v *View) SetFieldValue(columnID uint64, bitDepth uint, value uint64) (changed bool, err error) {
+	slice := columnID / SliceWidth
+	frag, err := v.CreateFragmentIfNotExists(slice)
+	if err != nil {
+		return changed, err
+	}
+	return frag.SetFieldValue(columnID, bitDepth, value)
+}
+
+// FieldSum returns the sum & count of a field.
+func (v *View) FieldSum(filter *Bitmap, bitDepth uint) (sum, count uint64, err error) {
+	for _, f := range v.Fragments() {
+		fsum, fcount, err := f.FieldSum(filter, bitDepth)
+		if err != nil {
+			return sum, count, err
+		}
+		sum += fsum
+		count += fcount
+	}
+	return sum, count, nil
+}
+
+// FieldRange returns bitmaps with a field value encoding matching the predicate.
+func (v *View) FieldRange(op pql.Token, bitDepth uint, predicate uint64) (*Bitmap, error) {
+	bm := NewBitmap()
+	for _, frag := range v.Fragments() {
+		other, err := frag.FieldRange(op, bitDepth, predicate)
+		if err != nil {
+			return nil, err
+		}
+		bm = bm.Union(other)
+	}
+	return bm, nil
+}
+
+// FieldRangeBetween returns bitmaps with a field value encoding matching any
+// value between predicateMin and predicateMax.
+func (v *View) FieldRangeBetween(bitDepth uint, predicateMin, predicateMax uint64) (*Bitmap, error) {
+	bm := NewBitmap()
+	for _, frag := range v.Fragments() {
+		other, err := frag.FieldRangeBetween(bitDepth, predicateMin, predicateMax)
+		if err != nil {
+			return nil, err
+		}
+		bm = bm.Union(other)
+	}
+	return bm, nil
 }
 
 // IsInverseView returns true if the view is used for storing an inverted representation.

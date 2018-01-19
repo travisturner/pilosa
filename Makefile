@@ -1,6 +1,6 @@
-.PHONY: glide vendor-update docker pilosa crossbuild install generate statik release test cover cover-pkg cover-viz
+.PHONY: dep docker pilosa release-build prerelease-build release prerelease prerelease-upload install generate statik test cover cover-pkg cover-viz clean docker-build docker-test
 
-GLIDE := $(shell command -v glide 2>/dev/null)
+DEP := $(shell command -v dep 2>/dev/null)
 STATIK := $(shell command -v statik 2>/dev/null)
 PROTOC := $(shell command -v protoc 2>/dev/null)
 VERSION := $(shell git describe --tags 2> /dev/null || echo unknown)
@@ -9,30 +9,28 @@ CLONE_URL=github.com/pilosa/pilosa
 PKGS := $(shell cd $(GOPATH)/src/$(CLONE_URL); go list ./... | grep -v vendor)
 BUILD_TIME=`date -u +%FT%T%z`
 LDFLAGS="-X github.com/pilosa/pilosa.Version=$(VERSION) -X github.com/pilosa/pilosa.BuildTime=$(BUILD_TIME)"
+DOCKER_GOLANG_IMAGE=golang:latest
 
 default: test pilosa
+
+clean:
+	rm -rf vendor build
 
 $(GOPATH)/bin:
 	mkdir $(GOPATH)/bin
 
-glide: $(GOPATH)/bin
-ifndef GLIDE
-	curl https://glide.sh/get | sh
+dep: $(GOPATH)/bin
+	go get -u github.com/golang/dep/cmd/dep
+
+vendor: Gopkg.toml
+ifndef DEP
+	make dep
 endif
+	dep ensure
+	touch vendor
 
-$(GLIDE):
-	make glide
-
-vendor: $(GLIDE) glide.yaml
-ifndef GLIDE
-	curl https://glide.sh/get | sh
-endif
-	glide install
-
-glide.lock: glide glide.yaml
-	glide update
-
-vendor-update: glide.lock
+Gopkg.lock: dep Gopkg.toml
+	dep ensure
 
 test: vendor
 	go test $(PKGS) $(TESTFLAGS)
@@ -48,7 +46,7 @@ cover-pkg:
 	mkdir -p build/coverage
 	touch build/coverage/$(subst /,-,$(PKG)).out
 	go test -coverprofile=build/coverage/$(subst /,-,$(PKG)).out $(PKG)
-	tail +2 build/coverage/$(subst /,-,$(PKG)).out >> build/coverage/all.out
+	tail -n +2 build/coverage/$(subst /,-,$(PKG)).out >> build/coverage/all.out
 
 cover-viz: cover
 	go tool cover -html=build/coverage/all.out
@@ -56,17 +54,32 @@ cover-viz: cover
 pilosa: vendor
 	go build -ldflags $(LDFLAGS) $(FLAGS) $(CLONE_URL)/cmd/pilosa
 
-crossbuild: vendor
-	mkdir -p build/pilosa-$(IDENTIFIER)
+release-build: vendor
+ifdef DOCKER_BUILD
+	make docker-build FLAGS="-o build/pilosa-$(IDENTIFIER)/pilosa"
+else
 	make pilosa FLAGS="-o build/pilosa-$(IDENTIFIER)/pilosa"
+endif
 	cp LICENSE README.md build/pilosa-$(IDENTIFIER)
 	tar -cvz -C build -f build/pilosa-$(IDENTIFIER).tar.gz pilosa-$(IDENTIFIER)/
 	@echo "Created release build: build/pilosa-$(IDENTIFIER).tar.gz"
 
 release:
-	make crossbuild GOOS=linux GOARCH=amd64
-	make crossbuild GOOS=linux GOARCH=386
-	make crossbuild GOOS=darwin GOARCH=amd64
+	make release-build GOOS=darwin GOARCH=amd64
+	make release-build GOOS=linux GOARCH=amd64 DOCKER_BUILD=1
+	make release-build GOOS=linux GOARCH=386 DOCKER_BUILD=1
+
+prerelease-build: vendor
+	make pilosa FLAGS="-o build/pilosa-master-$(GOOS)-$(GOARCH)/pilosa"
+	cp LICENSE README.md build/pilosa-master-$(GOOS)-$(GOARCH)
+	tar -cvz -C build -f build/pilosa-master-$(GOOS)-$(GOARCH).tar.gz pilosa-master-$(GOOS)-$(GOARCH)/
+	@echo "Created pre-release build: build/pilosa-master-$(GOOS)-$(GOARCH).tar.gz"
+
+prerelease:
+	make prerelease-build GOOS=linux GOARCH=amd64
+
+prerelease-upload: prerelease
+	aws s3 cp build/pilosa-master-linux-amd64.tar.gz s3://build.pilosa.com/pilosa-master-linux-amd64.tar.gz --acl public-read
 
 install: vendor
 	go install -ldflags $(LDFLAGS) $(FLAGS) $(CLONE_URL)/cmd/pilosa
@@ -94,3 +107,9 @@ endif
 docker:
 	docker build -t "pilosa:$(VERSION)" --build-arg ldflags=$(LDFLAGS) .
 	@echo "Created image: pilosa:$(VERSION)"
+
+docker-build:
+	docker run --rm -v $(PWD):/go/src/$(CLONE_URL) -w /go/src/$(CLONE_URL) -e GOOS=$(GOOS) -e GOARCH=$(GOARCH) $(DOCKER_GOLANG_IMAGE) go build -ldflags $(LDFLAGS) $(FLAGS) $(CLONE_URL)/cmd/pilosa
+
+docker-test:
+	docker run --rm -v $(PWD):/go/src/$(CLONE_URL) -w /go/src/$(CLONE_URL) $(DOCKER_GOLANG_IMAGE) go test $(TESTFLAGS) $(PKGS)

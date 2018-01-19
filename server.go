@@ -15,10 +15,10 @@
 package pilosa
 
 import (
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
@@ -33,14 +33,23 @@ import (
 
 	"github.com/CAFxX/gcnotifier"
 	"github.com/gogo/protobuf/proto"
+	"github.com/pilosa/pilosa/diagnostics"
 	"github.com/pilosa/pilosa/internal"
+	"golang.org/x/net/context"
+	"golang.org/x/sync/errgroup"
 )
 
 // Default server settings.
 const (
 	DefaultAntiEntropyInterval = 10 * time.Minute
 	DefaultPollingInterval     = 60 * time.Second
+	DefaultDiagnosticServer    = "https://diagnostics.pilosa.com/v0/diagnostics"
 )
+
+// Ensure Server implements interfaces.
+var _ Broadcaster = &Server{}
+var _ BroadcastHandler = &Server{}
+var _ StatusHandler = &Server{}
 
 // Server represents a holder wrapped by a running HTTP server.
 type Server struct {
@@ -55,22 +64,32 @@ type Server struct {
 	Handler           *Handler
 	Broadcaster       Broadcaster
 	BroadcastReceiver BroadcastReceiver
+	Gossiper          Gossiper
+	RemoteClient      *http.Client
 
 	// Cluster configuration.
 	// Host is replaced with actual host after opening if port is ":0".
-	Network string
-	Host    string
-	Cluster *Cluster
+	Network     string
+	URI         *URI
+	Cluster     *Cluster
+	diagnostics *diagnostics.Diagnostics
+	ClusterID   string
 
 	// Background monitoring intervals.
 	AntiEntropyInterval time.Duration
 	PollingInterval     time.Duration
 	MetricInterval      time.Duration
+	DiagnosticInterval  time.Duration
+
+	// TLS configuration
+	TLS *tls.Config
 
 	// Misc options.
 	MaxWritesPerRequest int
 
 	LogOutput io.Writer
+
+	defaultClient InternalClient
 }
 
 // NewServer returns a new instance of Server.
@@ -82,12 +101,14 @@ func NewServer() *Server {
 		Handler:           NewHandler(),
 		Broadcaster:       NopBroadcaster,
 		BroadcastReceiver: NopBroadcastReceiver,
+		diagnostics:       diagnostics.New(DefaultDiagnosticServer),
 
 		Network: "tcp",
 
 		AntiEntropyInterval: DefaultAntiEntropyInterval,
 		PollingInterval:     DefaultPollingInterval,
 		MetricInterval:      0,
+		DiagnosticInterval:  0,
 
 		LogOutput: os.Stderr,
 	}
@@ -99,27 +120,38 @@ func NewServer() *Server {
 
 // Open opens and initializes the server.
 func (s *Server) Open() error {
-	// Require a port in the hostname.
-	host, port, err := net.SplitHostPort(s.Host)
-	if err != nil {
-		return err
-	} else if port == "" {
-		port = DefaultPort
+	var ln net.Listener
+	var err error
+
+	// If bind URI has the https scheme, enable TLS
+	if s.URI.Scheme() == "https" && s.TLS != nil {
+		ln, err = tls.Listen("tcp", s.URI.HostPort(), s.TLS)
+		if err != nil {
+			return err
+		}
+	} else if s.URI.Scheme() == "http" {
+		// Open HTTP listener to determine port (if specified as :0).
+		ln, err = net.Listen(s.Network, s.URI.HostPort())
+		if err != nil {
+			return fmt.Errorf("net.Listen: %v", err)
+		}
+	} else {
+		return fmt.Errorf("unsupported scheme: %s", s.URI.Scheme())
 	}
 
-	// Open HTTP listener to determine port (if specified as :0).
-	ln, err := net.Listen(s.Network, ":"+port)
-	if err != nil {
-		return fmt.Errorf("net.Listen: %v", err)
-	}
 	s.ln = ln
 
-	// Determine hostname based on listening port.
-	s.Host = net.JoinHostPort(host, strconv.Itoa(s.ln.Addr().(*net.TCPAddr).Port))
+	if s.URI.Port() == 0 {
+		// If the port is 0, it is set automatically.
+		// Find out automatically set port and update the host.
+		s.URI.SetPort(uint16(s.ln.Addr().(*net.TCPAddr).Port))
+	}
 
 	// Create local node if no cluster is specified.
 	if len(s.Cluster.Nodes) == 0 {
-		s.Cluster.Nodes = []*Node{{Host: s.Host}}
+		s.Cluster.Nodes = []*Node{
+			{Scheme: s.URI.Scheme(), Host: s.URI.HostPort()},
+		}
 	}
 
 	for i, n := range s.Cluster.Nodes {
@@ -129,6 +161,7 @@ func (s *Server) Open() error {
 	}
 
 	// Open holder.
+	s.Holder.LogOutput = s.LogOutput
 	if err := s.Holder.Open(); err != nil {
 		return fmt.Errorf("opening Holder: %v", err)
 	}
@@ -142,33 +175,58 @@ func (s *Server) Open() error {
 		return fmt.Errorf("opening NodeSet: %v", err)
 	}
 
+	// Create default HTTP client
+	s.createDefaultClient(s.RemoteClient)
+
 	// Create executor for executing queries.
-	e := NewExecutor()
+	e := NewExecutor(s.RemoteClient)
 	e.Holder = s.Holder
-	e.Host = s.Host
+	e.Scheme = s.URI.Scheme()
+	e.Host = s.URI.HostPort()
 	e.Cluster = s.Cluster
 	e.MaxWritesPerRequest = s.MaxWritesPerRequest
+	s.Cluster.MaxWritesPerRequest = s.MaxWritesPerRequest
 
 	// Initialize HTTP handler.
 	s.Handler.Broadcaster = s.Broadcaster
+	s.Handler.BroadcastHandler = s
 	s.Handler.StatusHandler = s
-	s.Handler.Host = s.Host
+	s.Handler.URI = s.URI
 	s.Handler.Cluster = s.Cluster
 	s.Handler.Executor = e
 	s.Handler.LogOutput = s.LogOutput
 
 	// Initialize Holder.
 	s.Holder.Broadcaster = s.Broadcaster
-	s.Holder.LogOutput = s.LogOutput
 
 	// Serve HTTP.
-	go func() { http.Serve(ln, s.Handler) }()
+	go func() {
+		server := &http.Server{Handler: s.Handler}
+		go func() {
+			<-s.closing
+			server.Close()
+		}()
+		err := server.Serve(ln)
+		if err != nil && err.Error() != "http: Server closed" {
+			s.Logger().Printf("HTTP handler terminated with error: %s\n", err)
+		}
+	}()
+
+	// load local ID
+	if err := s.Holder.loadLocalID(); err != nil {
+		s.Logger().Println(err)
+	}
+
+	if err := s.loadClusterID(); err != nil {
+		s.Logger().Println(err)
+	}
 
 	// Start background monitoring.
-	s.wg.Add(3)
+	s.wg.Add(4)
 	go func() { defer s.wg.Done(); s.monitorAntiEntropy() }()
 	go func() { defer s.wg.Done(); s.monitorMaxSlices() }()
 	go func() { defer s.wg.Done(); s.monitorRuntime() }()
+	go func() { defer s.wg.Done(); s.monitorDiagnostics() }()
 
 	return nil
 }
@@ -196,15 +254,34 @@ func (s *Server) Addr() net.Addr {
 	}
 	return s.ln.Addr()
 }
+func GetHTTPClient(t *tls.Config) *http.Client {
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+			DualStack: true,
+		}).DialContext,
+		MaxIdleConns:          1000,
+		MaxIdleConnsPerHost:   200,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+	if t != nil {
+		transport.TLSClientConfig = t
+	}
+	return &http.Client{Transport: transport}
+}
 
-func (s *Server) logger() *log.Logger { return log.New(s.LogOutput, "", log.LstdFlags) }
+// Logger returns a logger that writes to LogOutput
+func (s *Server) Logger() *log.Logger { return log.New(s.LogOutput, "", log.LstdFlags) }
 
 func (s *Server) monitorAntiEntropy() {
-	t := time.Now()
 	ticker := time.NewTicker(s.AntiEntropyInterval)
 	defer ticker.Stop()
 
-	s.logger().Printf("holder sync monitor initializing (%s interval)", s.AntiEntropyInterval)
+	s.Logger().Printf("holder sync monitor initializing (%s interval)", s.AntiEntropyInterval)
 
 	for {
 		// Wait for tick or a close.
@@ -214,27 +291,28 @@ func (s *Server) monitorAntiEntropy() {
 		case <-ticker.C:
 			s.Holder.Stats.Count("AntiEntropy", 1, 1.0)
 		}
-
-		s.logger().Printf("holder sync beginning")
+		t := time.Now()
+		s.Logger().Printf("holder sync beginning")
 
 		// Initialize syncer with local holder and remote client.
 		var syncer HolderSyncer
 		syncer.Holder = s.Holder
-		syncer.Host = s.Host
+		syncer.URI = s.URI
 		syncer.Cluster = s.Cluster
 		syncer.Closing = s.closing
+		syncer.RemoteClient = s.RemoteClient
 
 		// Sync holders.
 		if err := syncer.SyncHolder(); err != nil {
-			s.logger().Printf("holder sync error: err=%s", err)
+			s.Logger().Printf("holder sync error: err=%s", err)
 			continue
 		}
 
 		// Record successful sync in log.
-		s.logger().Printf("holder sync complete")
+		s.Logger().Printf("holder sync complete")
+		dif := time.Since(t)
+		s.Holder.Stats.Histogram("AntiEntropyDuration", float64(dif), 1.0)
 	}
-	dif := time.Since(t)
-	s.Holder.Stats.Histogram("AntiEntropyDuration", float64(dif), 1.0)
 }
 
 // monitorMaxSlices periodically pulls the highest slice from each node in the cluster.
@@ -256,8 +334,8 @@ func (s *Server) monitorMaxSlices() {
 
 		oldmaxslices := s.Holder.MaxSlices()
 		for _, node := range s.Cluster.Nodes {
-			if s.Host != node.Host {
-				maxSlices, _ := checkMaxSlices(node.Host)
+			if s.URI.HostPort() != node.Host {
+				maxSlices, _ := s.checkMaxSlices(node.Scheme, node.Host)
 				for index, newmax := range maxSlices {
 					// if we don't know about an index locally, log an error because
 					// indexes should be created and synced prior to slice creation
@@ -267,7 +345,7 @@ func (s *Server) monitorMaxSlices() {
 							localIndex.SetRemoteMaxSlice(newmax)
 						}
 					} else {
-						s.logger().Printf("Local Index not found: %s", index)
+						s.Logger().Printf("Local Index not found: %s", index)
 					}
 				}
 			}
@@ -309,9 +387,11 @@ func (s *Server) ReceiveMessage(pb proto.Message) error {
 		opt := FrameOptions{
 			RowLabel:       obj.Meta.RowLabel,
 			InverseEnabled: obj.Meta.InverseEnabled,
+			RangeEnabled:   obj.Meta.RangeEnabled,
 			CacheType:      obj.Meta.CacheType,
 			CacheSize:      obj.Meta.CacheSize,
 			TimeQuantum:    TimeQuantum(obj.Meta.TimeQuantum),
+			Fields:         decodeFields(obj.Meta.Fields),
 		}
 		_, err := idx.CreateFrame(obj.Frame, opt)
 		if err != nil {
@@ -322,8 +402,57 @@ func (s *Server) ReceiveMessage(pb proto.Message) error {
 		if err := idx.DeleteFrame(obj.Frame); err != nil {
 			return err
 		}
+	case *internal.CreateInputDefinitionMessage:
+		idx := s.Holder.Index(obj.Index)
+		if idx == nil {
+			return fmt.Errorf("Local Index not found: %s", obj.Index)
+		}
+		idx.CreateInputDefinition(obj.Definition)
+	case *internal.DeleteInputDefinitionMessage:
+		idx := s.Holder.Index(obj.Index)
+		err := idx.DeleteInputDefinition(obj.Name)
+		if err != nil {
+			return err
+		}
+	case *internal.DeleteViewMessage:
+		f := s.Holder.Frame(obj.Index, obj.Frame)
+		if f == nil {
+			return fmt.Errorf("Local Frame not found: %s", obj.Frame)
+		}
+		err := f.DeleteView(obj.View)
+		if err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+// SendSync represents an implementation of Broadcaster.
+func (s *Server) SendSync(pb proto.Message) error {
+	var eg errgroup.Group
+	for _, node := range s.Cluster.Nodes {
+		uri, err := node.URI()
+		if err != nil {
+			return err
+		}
+
+		// Don't forward the message to ourselves.
+		if *s.URI == *uri {
+			continue
+		}
+
+		ctx := context.WithValue(context.Background(), "uri", uri)
+		eg.Go(func() error {
+			return s.defaultClient.SendMessage(ctx, pb)
+		})
+	}
+
+	return eg.Wait()
+}
+
+// SendAsync represents an implementation of Broadcaster.
+func (s *Server) SendAsync(pb proto.Message) error {
+	return s.Gossiper.SendAsync(pb)
 }
 
 // LocalStatus returns the state of the local node as well as the
@@ -336,14 +465,15 @@ func (s *Server) LocalStatus() (proto.Message, error) {
 	}
 
 	ns := internal.NodeStatus{
-		Host:    s.Host,
+		Scheme:  s.URI.Scheme(),
+		Host:    s.URI.HostPort(),
 		State:   NodeStateUp,
 		Indexes: EncodeIndexes(s.Holder.Indexes()),
 	}
 
 	// Append Slice list per this Node's indexes
 	for _, index := range ns.Indexes {
-		index.Slices = s.Cluster.OwnsSlices(index.Name, index.MaxSlice, s.Host)
+		index.Slices = s.Cluster.OwnsSlices(index.Name, index.MaxSlice, s.URI.HostPort())
 	}
 
 	return &ns, nil
@@ -356,7 +486,7 @@ func (s *Server) ClusterStatus() (proto.Message, error) {
 	if err != nil {
 		return nil, err
 	}
-	node := s.Cluster.NodeByHost(s.Host)
+	node := s.Cluster.NodeByHost(s.URI.HostPort())
 	node.SetStatus(ns.(*internal.NodeStatus))
 
 	// Update NodeState for all nodes.
@@ -366,7 +496,7 @@ func (s *Server) ClusterStatus() (proto.Message, error) {
 		// the local node as UP.
 		// TODO: we should be able to remove this check if/when cluster.Nodes and
 		// cluster.NodeSet are unified.
-		if host == s.Host {
+		if host == s.URI.HostPort() {
 			nodeState = NodeStateUp
 		}
 		node := s.Cluster.NodeByHost(host)
@@ -413,11 +543,11 @@ func (s *Server) mergeRemoteStatus(ns *internal.NodeStatus) error {
 	return nil
 }
 
-func checkMaxSlices(hostport string) (map[string]uint64, error) {
+func (s *Server) checkMaxSlices(scheme string, hostPort string) (map[string]uint64, error) {
 	// Create HTTP request.
 	req, err := http.NewRequest("GET", (&url.URL{
-		Scheme: "http",
-		Host:   hostport,
+		Scheme: scheme,
+		Host:   hostPort,
 		Path:   "/slices/max",
 	}).String(), nil)
 
@@ -430,37 +560,64 @@ func checkMaxSlices(hostport string) (map[string]uint64, error) {
 	req.Header.Set("Content-Type", "application/x-protobuf")
 	req.Header.Set("User-Agent", "pilosa/"+Version)
 
-	// Send request to remote node.
-	resp, err := http.DefaultClient.Do(req)
+	nodeURI, err := NewURIFromAddress(hostPort)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	nodeURI.SetScheme(scheme)
+	ctx := context.WithValue(context.Background(), "uri", nodeURI)
+	return s.defaultClient.MaxSliceByIndex(ctx)
+}
 
-	// Read response into buffer.
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
+// monitorDiagnostics periodically polls the Pilosa Indexes for cluster info.
+func (s *Server) monitorDiagnostics() {
+	if s.DiagnosticInterval <= 0 {
+		s.Logger().Printf("diagnostics disabled")
+		return
 	}
 
-	// Check status code.
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("invalid status checkMaxSlices: code=%d, err=%s, req=%v", resp.StatusCode, body, req)
+	s.diagnostics.SetLogger(s.LogOutput)
+	s.diagnostics.SetVersion(Version)
+	s.diagnostics.SetInterval(s.DiagnosticInterval)
+	s.diagnostics.Open()
+	s.diagnostics.Set("Host", s.URI.host)
+	s.diagnostics.Set("Cluster", strings.Join(s.Cluster.NodeSetHosts(), ","))
+	s.diagnostics.Set("NumNodes", len(s.Cluster.Nodes))
+	s.diagnostics.Set("NumCPU", runtime.NumCPU())
+	s.diagnostics.Set("LocalID", s.Holder.LocalID)
+	s.diagnostics.Set("ClusterID", s.ClusterID)
+	s.diagnostics.EnrichWithOSInfo()
+
+	// Flush the diagnostics metrics at startup, then on each tick interval
+	flush := func() {
+		enrichDiagnosticsWithSchemaProperties(s.diagnostics, s.Holder)
+		openFiles, err := CountOpenFiles()
+		if err == nil {
+			s.diagnostics.Set("OpenFiles", openFiles)
+		}
+		s.diagnostics.Set("GoRoutines", runtime.NumGoroutine())
+		s.diagnostics.EnrichWithMemoryInfo()
+		s.diagnostics.CheckVersion()
+		s.diagnostics.Flush()
 	}
 
-	// Decode response object.
-	pb := internal.MaxSlicesResponse{}
-
-	if err = proto.Unmarshal(body, &pb); err != nil {
-		return nil, err
+	ticker := time.NewTicker(s.DiagnosticInterval)
+	defer ticker.Stop()
+	flush()
+	for {
+		// Wait for tick or a close.
+		select {
+		case <-s.closing:
+			return
+		case <-ticker.C:
+			flush()
+		}
 	}
-
-	return pb.MaxSlices, nil
 }
 
 // monitorRuntime periodically polls the Go runtime metrics.
 func (s *Server) monitorRuntime() {
-	// Disable metrics when poll interval is zero
+	// Disable metrics when poll interval is zero.
 	if s.MetricInterval <= 0 {
 		return
 	}
@@ -472,7 +629,7 @@ func (s *Server) monitorRuntime() {
 	gcn := gcnotifier.New()
 	defer gcn.Close()
 
-	s.logger().Printf("runtime stats initializing (%s interval)", s.MetricInterval)
+	s.Logger().Printf("runtime stats initializing (%s interval)", s.MetricInterval)
 
 	for {
 		// Wait for tick or a close.
@@ -480,18 +637,21 @@ func (s *Server) monitorRuntime() {
 		case <-s.closing:
 			return
 		case <-gcn.AfterGC():
-			// GC just ran
+			// GC just ran.
 			s.Holder.Stats.Count("garbage_collection", 1, 1.0)
 		case <-ticker.C:
 		}
 
-		// Record the number of go routines
+		// Record the number of go routines.
 		s.Holder.Stats.Gauge("goroutines", float64(runtime.NumGoroutine()), 1.0)
 
-		// Open File handles
-		s.Holder.Stats.Gauge("OpenFiles", float64(CountOpenFiles()), 1.0)
+		openFiles, err := CountOpenFiles()
+		// Open File handles.
+		if err == nil {
+			s.Holder.Stats.Gauge("OpenFiles", float64(openFiles), 1.0)
+		}
 
-		// Runtime memory metrics
+		// Runtime memory metrics.
 		runtime.ReadMemStats(&m)
 		s.Holder.Stats.Gauge("HeapAlloc", float64(m.HeapAlloc), 1.0)
 		s.Holder.Stats.Gauge("HeapInuse", float64(m.HeapInuse), 1.0)
@@ -501,27 +661,48 @@ func (s *Server) monitorRuntime() {
 	}
 }
 
-// CountOpenFiles on opperating systems that support lsof
-func CountOpenFiles() int {
-	count := 0
+func (s *Server) createDefaultClient(remoteClient *http.Client) {
+	s.defaultClient = NewInternalHTTPClientFromURI(nil, remoteClient)
+}
 
+func (s *Server) loadClusterID() error {
+	// If this is the first node in the cluster, set the ClusterID to its ID
+	node0URI, err := s.Cluster.Nodes[0].URI()
+	if err == nil {
+		if s.URI.Equals(node0URI) {
+			s.ClusterID = s.Holder.LocalID
+			return nil
+		}
+	} else {
+		return err
+	}
+	if clusterID, err := s.defaultClient.NodeID(node0URI); err == nil {
+		s.ClusterID = clusterID
+		return nil
+	} else {
+		return err
+	}
+}
+
+// CountOpenFiles on operating systems that support lsof.
+func CountOpenFiles() (int, error) {
 	switch runtime.GOOS {
 	case "darwin", "linux", "unix", "freebsd":
 		// -b option avoid kernel blocks
 		pid := os.Getpid()
 		out, err := exec.Command("/bin/sh", "-c", fmt.Sprintf("lsof -b -p %v", pid)).Output()
 		if err != nil {
-			log.Fatal(err)
+			return 0, fmt.Errorf("calling lsof: %s", err)
 		}
 		// only count lines with our pid, avoiding warning messages from -b
 		lines := strings.Split(string(out), strconv.Itoa(pid))
-		count = len(lines)
+		return len(lines), nil
 	case "windows":
 		// TODO: count open file handles on windows
+		return 0, errors.New("CountOpenFiles() on Windows is not supported")
 	default:
-
+		return 0, errors.New("CountOpenFiles() on this OS is not supported")
 	}
-	return count
 }
 
 // StatusHandler specifies two methods which an object must implement to share
@@ -531,4 +712,40 @@ type StatusHandler interface {
 	LocalStatus() (proto.Message, error)
 	ClusterStatus() (proto.Message, error)
 	HandleRemoteStatus(proto.Message) error
+}
+
+type diagnosticsFrameProperties struct {
+	BSIFieldCount      int
+	TimeQuantumEnabled bool
+}
+
+func enrichDiagnosticsWithSchemaProperties(d *diagnostics.Diagnostics, holder *Holder) {
+	// NOTE: this function is not in the diagnostics package, since circular imports are not allowed.
+	var numSlices uint64
+	numFrames := 0
+	numIndexes := 0
+	bsiFieldCount := 0
+	timeQuantumEnabled := false
+
+	for _, index := range holder.Indexes() {
+		numSlices += index.MaxSlice() + 1
+		numIndexes += 1
+		for _, frame := range index.Frames() {
+			numFrames += 1
+			if frame.rangeEnabled {
+				if fields, err := frame.GetFields(); err == nil {
+					bsiFieldCount += len(fields.Fields)
+				}
+			}
+			if frame.TimeQuantum() != "" {
+				timeQuantumEnabled = true
+			}
+		}
+	}
+
+	d.Set("NumIndexes", numIndexes)
+	d.Set("NumFrames", numFrames)
+	d.Set("NumSlices", numSlices)
+	d.Set("BSIFieldCount", bsiFieldCount)
+	d.Set("TimeQuantumEnabled", timeQuantumEnabled)
 }

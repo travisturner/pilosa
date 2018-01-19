@@ -28,6 +28,7 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"net/http"
 	"os"
 	"sort"
 	"sync"
@@ -39,6 +40,7 @@ import (
 
 	"github.com/gogo/protobuf/proto"
 	"github.com/pilosa/pilosa/internal"
+	"github.com/pilosa/pilosa/pql"
 	"github.com/pilosa/pilosa/roaring"
 )
 
@@ -66,7 +68,7 @@ const (
 
 // Fragment represents the intersection of a frame and slice in an index.
 type Fragment struct {
-	mu sync.Mutex
+	mu sync.RWMutex
 
 	// Composite identifiers
 	index string
@@ -186,8 +188,9 @@ func (f *Fragment) Open() error {
 // openStorage opens the storage bitmap.
 func (f *Fragment) openStorage() error {
 	// Create a roaring bitmap to serve as storage for the slice.
-	f.storage = roaring.NewBitmap()
-
+	if f.storage == nil {
+		f.storage = roaring.NewBitmap()
+	}
 	// Open the data file to be mmap'd and used as an ops log.
 	file, err := os.OpenFile(f.path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
 	if err != nil {
@@ -205,10 +208,11 @@ func (f *Fragment) openStorage() error {
 	if err != nil {
 		return err
 	} else if fi.Size() == 0 {
-		if _, err := f.storage.WriteTo(f.file); err != nil {
+		bi := bufio.NewWriter(f.file)
+		if _, err := f.storage.WriteTo(bi); err != nil {
 			return fmt.Errorf("init storage file: %s", err)
 		}
-
+		bi.Flush()
 		fi, err = f.file.Stat()
 		if err != nil {
 			return err
@@ -249,6 +253,8 @@ func (f *Fragment) openCache() error {
 		f.cache = NewRankCache(f.CacheSize)
 	case CacheTypeLRU:
 		f.cache = NewLRUCache(f.CacheSize)
+	case CacheTypeNone:
+		f.cache = NewNopCache()
 	default:
 		return ErrInvalidCacheType
 	}
@@ -265,15 +271,14 @@ func (f *Fragment) openCache() error {
 	// Unmarshal cache data.
 	var pb internal.Cache
 	if err := proto.Unmarshal(buf, &pb); err != nil {
-		log.Printf("error unmarshaling cache data, skipping: path=%s, err=%s", path, err)
+		f.logger().Printf("error unmarshaling cache data, skipping: path=%s, err=%s", path, err)
 		return nil
 	}
 
 	// Read in all rows by ID.
 	// This will cause them to be added to the cache.
 	for _, id := range pb.IDs {
-		//n := f.storage.CountRange(id*SliceWidth, (id+1)*SliceWidth)
-		n := f.row(id, true, true).Count()
+		n := f.storage.CountRange(id*SliceWidth, (id+1)*SliceWidth)
 		f.cache.BulkAdd(id, n)
 	}
 	f.cache.Invalidate()
@@ -292,11 +297,13 @@ func (f *Fragment) close() error {
 	// Flush cache if closing gracefully.
 	if err := f.flushCache(); err != nil {
 		f.logger().Printf("fragment: error flushing cache on close: err=%s, path=%s", err, f.path)
+		return err
 	}
 
 	// Close underlying storage.
 	if err := f.closeStorage(); err != nil {
 		f.logger().Printf("fragment: error closing storage: err=%s, path=%s", err, f.path)
+		return err
 	}
 
 	// Remove checksums.
@@ -307,7 +314,8 @@ func (f *Fragment) close() error {
 
 func (f *Fragment) closeStorage() error {
 	// Clear the storage bitmap so it doesn't access the closed mmap.
-	f.storage = roaring.NewBitmap()
+
+	//f.storage = roaring.NewBitmap()
 
 	// Unmap the file.
 	if f.storageData != nil {
@@ -470,6 +478,321 @@ func (f *Fragment) clearBit(rowID, columnID uint64) (changed bool, err error) {
 	f.stats.Count("clearBit", 1, 1.0)
 
 	return changed, nil
+}
+
+func (f *Fragment) bit(rowID, columnID uint64) (bool, error) {
+	pos, err := f.pos(rowID, columnID)
+	if err != nil {
+		return false, err
+	}
+	return f.storage.Contains(pos), nil
+}
+
+// FieldValue uses a column of bits to read a multi-bit value.
+func (f *Fragment) FieldValue(columnID uint64, bitDepth uint) (value uint64, exists bool, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	// If existence bit is unset then ignore remaining bits.
+	if v, err := f.bit(uint64(bitDepth), columnID); err != nil {
+		return 0, false, err
+	} else if !v {
+		return 0, false, nil
+	}
+
+	// Compute other bits into a value.
+	for i := uint(0); i < bitDepth; i++ {
+		if v, err := f.bit(uint64(i), columnID); err != nil {
+			return 0, false, err
+		} else if v {
+			value |= (1 << i)
+		}
+	}
+
+	return value, true, nil
+}
+
+// SetFieldValue uses a column of bits to set a multi-bit value.
+func (f *Fragment) SetFieldValue(columnID uint64, bitDepth uint, value uint64) (changed bool, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	for i := uint(0); i < bitDepth; i++ {
+		if value&(1<<i) != 0 {
+			if c, err := f.setBit(uint64(i), columnID); err != nil {
+				return changed, err
+			} else if c {
+				changed = true
+			}
+		} else {
+			if c, err := f.clearBit(uint64(i), columnID); err != nil {
+				return changed, err
+			} else if c {
+				changed = true
+			}
+		}
+	}
+
+	// Mark value as set.
+	if c, err := f.setBit(uint64(bitDepth), columnID); err != nil {
+		return changed, err
+	} else if c {
+		changed = true
+	}
+
+	return changed, nil
+}
+
+// importSetFieldValue is a more efficient SetFieldValue just for imports.
+func (f *Fragment) importSetFieldValue(columnID uint64, bitDepth uint, value uint64) (changed bool, err error) {
+
+	for i := uint(0); i < bitDepth; i++ {
+		if value&(1<<i) != 0 {
+			bit, err := f.pos(uint64(i), columnID)
+			if err != nil {
+				return changed, err
+			}
+			if c, err := f.storage.Add(bit); err != nil {
+				return changed, err
+			} else if c {
+				changed = true
+			}
+		} else {
+			bit, err := f.pos(uint64(i), columnID)
+			if err != nil {
+				return changed, err
+			}
+			if c, err := f.storage.Remove(bit); err != nil {
+				return changed, err
+			} else if c {
+				changed = true
+			}
+		}
+	}
+
+	// Mark value as set.
+	p, err := f.pos(uint64(bitDepth), columnID)
+	if err != nil {
+		return changed, err
+	}
+	if c, err := f.storage.Add(p); err != nil {
+		return changed, err
+	} else if c {
+		changed = true
+	}
+
+	return changed, nil
+}
+
+// FieldSum returns the sum of a given field as well as the number of columns involved.
+// A bitmap can be passed in to optionally filter the computed columns.
+func (f *Fragment) FieldSum(filter *Bitmap, bitDepth uint) (sum, count uint64, err error) {
+	// Compute count based on the existence bit.
+	row := f.Row(uint64(bitDepth))
+	if filter != nil {
+		count = row.IntersectionCount(filter)
+	} else {
+		count = row.Count()
+	}
+
+	// Compute the sum based on the bit count of each row multiplied by the
+	// place value of each row. For example, 10 bits in the 1's place plus
+	// 4 bits in the 2's place plus 3 bits in the 4's place equals a total
+	// sum of 30:
+	//
+	//   10*(2^0) + 4*(2^1) + 3*(2^2) = 30
+	//
+	for i := uint(0); i < bitDepth; i++ {
+		row := f.Row(uint64(i))
+		cnt := uint64(0)
+		if filter != nil {
+			cnt = row.IntersectionCount(filter)
+		} else {
+			cnt = row.Count()
+		}
+		sum += (1 << i) * cnt
+	}
+
+	return sum, count, nil
+}
+
+// FieldRange returns bitmaps with a field value encoding matching the predicate.
+func (f *Fragment) FieldRange(op pql.Token, bitDepth uint, predicate uint64) (*Bitmap, error) {
+	switch op {
+	case pql.EQ:
+		return f.fieldRangeEQ(bitDepth, predicate)
+	case pql.NEQ:
+		return f.fieldRangeNEQ(bitDepth, predicate)
+	case pql.LT, pql.LTE:
+		return f.fieldRangeLT(bitDepth, predicate, op == pql.LTE)
+	case pql.GT, pql.GTE:
+		return f.fieldRangeGT(bitDepth, predicate, op == pql.GTE)
+	default:
+		return nil, ErrInvalidRangeOperation
+	}
+}
+
+func (f *Fragment) fieldRangeEQ(bitDepth uint, predicate uint64) (*Bitmap, error) {
+	// Start with set of columns with values set.
+	b := f.Row(uint64(bitDepth))
+
+	// Filter any bits that don't match the current bit value.
+	for i := int(bitDepth - 1); i >= 0; i-- {
+		row := f.Row(uint64(i))
+		bit := (predicate >> uint(i)) & 1
+
+		if bit == 1 {
+			b = b.Intersect(row)
+		} else {
+			b = b.Difference(row)
+		}
+	}
+
+	return b, nil
+}
+
+func (f *Fragment) fieldRangeNEQ(bitDepth uint, predicate uint64) (*Bitmap, error) {
+	// Start with set of columns with values set.
+	b := f.Row(uint64(bitDepth))
+
+	// Get the equal bitmap.
+	eq, err := f.fieldRangeEQ(bitDepth, predicate)
+	if err != nil {
+		return nil, err
+	}
+
+	// Not-null minus the equal bitmap.
+	b = b.Difference(eq)
+
+	return b, nil
+}
+
+func (f *Fragment) fieldRangeLT(bitDepth uint, predicate uint64, allowEquality bool) (*Bitmap, error) {
+	keep := NewBitmap()
+
+	// Start with set of columns with values set.
+	b := f.Row(uint64(bitDepth))
+
+	// Filter any bits that don't match the current bit value.
+	leadingZeros := true
+	for i := int(bitDepth - 1); i >= 0; i-- {
+		row := f.Row(uint64(i))
+		bit := (predicate >> uint(i)) & 1
+
+		// Remove any columns with higher bits set.
+		if leadingZeros {
+			if bit == 0 {
+				b = b.Difference(row)
+				continue
+			} else {
+				leadingZeros = false
+			}
+		}
+
+		// Handle last bit differently.
+		// If bit is zero then return only already kept columns.
+		// If bit is one then remove any one columns.
+		if i == 0 && !allowEquality {
+			if bit == 0 {
+				return keep, nil
+			}
+			return b.Difference(row.Difference(keep)), nil
+		}
+
+		// If bit is zero then remove all set columns not in excluded bitmap.
+		if bit == 0 {
+			b = b.Difference(row.Difference(keep))
+			continue
+		}
+
+		// If bit is set then add columns for set bits to exclude.
+		// Don't bother to compute this on the final iteration.
+		if i > 0 {
+			keep = keep.Union(b.Difference(row))
+		}
+	}
+
+	return b, nil
+}
+
+func (f *Fragment) fieldRangeGT(bitDepth uint, predicate uint64, allowEquality bool) (*Bitmap, error) {
+	b := f.Row(uint64(bitDepth))
+	keep := NewBitmap()
+
+	// Filter any bits that don't match the current bit value.
+	for i := int(bitDepth - 1); i >= 0; i-- {
+		row := f.Row(uint64(i))
+		bit := (predicate >> uint(i)) & 1
+
+		// Handle last bit differently.
+		// If bit is one then return only already kept columns.
+		// If bit is zero then remove any unset columns.
+		if i == 0 && !allowEquality {
+			if bit == 1 {
+				return keep, nil
+			}
+			return b.Difference(b.Difference(row).Difference(keep)), nil
+		}
+
+		// If bit is set then remove all unset columns not already kept.
+		if bit == 1 {
+			b = b.Difference(b.Difference(row).Difference(keep))
+			continue
+		}
+
+		// If bit is unset then add columns with set bit to keep.
+		// Don't bother to compute this on the final iteration.
+		if i > 0 {
+			keep = keep.Union(b.Intersect(row))
+		}
+	}
+
+	return b, nil
+}
+
+// FieldNotNull returns the not-null row (stored at bitDepth).
+func (f *Fragment) FieldNotNull(bitDepth uint) (*Bitmap, error) {
+	return f.Row(uint64(bitDepth)), nil
+}
+
+// FieldRangeBetween returns bitmaps with a field value encoding matching any value between predicateMin and predicateMax.
+func (f *Fragment) FieldRangeBetween(bitDepth uint, predicateMin, predicateMax uint64) (*Bitmap, error) {
+	b := f.Row(uint64(bitDepth))
+	keep1 := NewBitmap() // GTE
+	keep2 := NewBitmap() // LTE
+
+	// Filter any bits that don't match the current bit value.
+	for i := int(bitDepth - 1); i >= 0; i-- {
+		row := f.Row(uint64(i))
+		bit1 := (predicateMin >> uint(i)) & 1
+		bit2 := (predicateMax >> uint(i)) & 1
+
+		// GTE predicateMin
+		// If bit is set then remove all unset columns not already kept.
+		if bit1 == 1 {
+			b = b.Difference(b.Difference(row).Difference(keep1))
+		} else {
+			// If bit is unset then add columns with set bit to keep.
+			// Don't bother to compute this on the final iteration.
+			if i > 0 {
+				keep1 = keep1.Union(b.Intersect(row))
+			}
+		}
+
+		// LTE predicateMin
+		// If bit is zero then remove all set columns not in excluded bitmap.
+		if bit2 == 0 {
+			b = b.Difference(row.Difference(keep2))
+		} else {
+			// If bit is set then add columns for set bits to exclude.
+			// Don't bother to compute this on the final iteration.
+			if i > 0 {
+				keep2 = keep2.Union(b.Difference(row))
+			}
+		}
+	}
+
+	return b, nil
 }
 
 // pos translates the row ID and column ID into a position in the storage bitmap.
@@ -639,6 +962,10 @@ func (f *Fragment) Top(opt TopOptions) ([]Pair, error) {
 }
 
 func (f *Fragment) topBitmapPairs(rowIDs []uint64) []BitmapPair {
+	// Don't retrieve from storage if CacheTypeNone.
+	if f.CacheType == CacheTypeNone {
+		return f.cache.Top()
+	}
 	// If no specific rows are requested, retrieve top rows.
 	if len(rowIDs) == 0 {
 		f.mu.Lock()
@@ -1003,6 +1330,39 @@ func (f *Fragment) Import(rowIDs, columnIDs []uint64) error {
 	return nil
 }
 
+// ImportValue bulk imports a set of range-encoded values.
+func (f *Fragment) ImportValue(columnIDs, values []uint64, bitDepth uint) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	// Verify that there are an equal number of column ids and values.
+	if len(columnIDs) != len(values) {
+		return fmt.Errorf("mismatch of column/value len: %d != %d", len(columnIDs), len(values))
+	}
+
+	f.storage.OpWriter = nil
+	// Process every value.
+	// If an error occurs then reopen the storage.
+	if err := func() error {
+		for i := range columnIDs {
+			columnID, value := columnIDs[i], values[i]
+
+			_, err := f.importSetFieldValue(columnID, bitDepth, value)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}(); err != nil {
+		_ = f.closeStorage()
+		_ = f.openStorage()
+		return err
+	}
+	if err := f.snapshot(); err != nil {
+		return err
+	}
+	return nil
+}
+
 // incrementOpN increase the operation count by one.
 // If the count exceeds the maximum allowed then a snapshot is performed.
 func (f *Fragment) incrementOpN() error {
@@ -1048,7 +1408,9 @@ func (f *Fragment) snapshot() error {
 	bw := bufio.NewWriter(file)
 	if _, err := f.storage.WriteTo(bw); err != nil {
 		return fmt.Errorf("snapshot write to: %s", err)
-	} else if err := bw.Flush(); err != nil {
+	}
+
+	if err := bw.Flush(); err != nil {
 		return fmt.Errorf("flush: %s", err)
 	}
 
@@ -1318,8 +1680,9 @@ func (h *blockHasher) WriteValue(v uint64) {
 type FragmentSyncer struct {
 	Fragment *Fragment
 
-	Host    string
-	Cluster *Cluster
+	Host         string
+	Cluster      *Cluster
+	RemoteClient *http.Client
 
 	Closing <-chan struct{}
 }
@@ -1354,7 +1717,7 @@ func (s *FragmentSyncer) SyncFragment() error {
 		}
 
 		// Retrieve remote blocks.
-		client, err := NewClient(node.Host)
+		client, err := NewInternalHTTPClient(node.Host, s.RemoteClient)
 		if err != nil {
 			return err
 		}
@@ -1422,7 +1785,7 @@ func (s *FragmentSyncer) syncBlock(id int) error {
 
 	// Read pairs from each remote block.
 	var pairSets []PairSet
-	var clients []*Client
+	var clients []InternalClient
 	for _, node := range s.Cluster.FragmentNodes(f.Index(), f.Slice()) {
 		if s.Host == node.Host {
 			continue
@@ -1433,7 +1796,7 @@ func (s *FragmentSyncer) syncBlock(id int) error {
 			return nil
 		}
 
-		client, err := NewClient(node.Host)
+		client, err := NewInternalHTTPClient(node.Host, s.RemoteClient)
 		if err != nil {
 			return err
 		}
@@ -1465,32 +1828,43 @@ func (s *FragmentSyncer) syncBlock(id int) error {
 	// Write updates to remote blocks.
 	for i := 0; i < len(clients); i++ {
 		set, clear := sets[i], clears[i]
+		count := 0
 
 		// Ignore if there are no differences.
 		if len(set.ColumnIDs) == 0 && len(clear.ColumnIDs) == 0 {
 			continue
 		}
 
-		// Generate query with sets & clears.
-		var buf bytes.Buffer
+		// Generate query with sets & clears, and group the requests to not exceed MaxWritesPerRequest.
+		total := len(set.ColumnIDs) + len(clear.ColumnIDs)
+		buffers := make([]bytes.Buffer, int(math.Ceil(float64(total)/float64(s.Cluster.MaxWritesPerRequest))))
 
 		// Only sync the standard block.
 		for j := 0; j < len(set.ColumnIDs); j++ {
-			fmt.Fprintf(&buf, "SetBit(frame=%q, rowID=%d, columnID=%d)\n", f.Frame(), set.RowIDs[j], (f.Slice()*SliceWidth)+set.ColumnIDs[j])
+			fmt.Fprintf(&(buffers[count/s.Cluster.MaxWritesPerRequest]), "SetBit(frame=%q, rowID=%d, columnID=%d)\n", f.Frame(), set.RowIDs[j], (f.Slice()*SliceWidth)+set.ColumnIDs[j])
+			count++
 		}
 		for j := 0; j < len(clear.ColumnIDs); j++ {
-			fmt.Fprintf(&buf, "ClearBit(frame=%q, rowID=%d, columnID=%d)\n", f.Frame(), clear.RowIDs[j], (f.Slice()*SliceWidth)+clear.ColumnIDs[j])
+			fmt.Fprintf(&(buffers[count/s.Cluster.MaxWritesPerRequest]), "ClearBit(frame=%q, rowID=%d, columnID=%d)\n", f.Frame(), clear.RowIDs[j], (f.Slice()*SliceWidth)+clear.ColumnIDs[j])
+			count++
 		}
 
-		// Verify sync is not prematurely closing.
-		if s.isClosing() {
-			return nil
-		}
+		// Iterate over the buffers.
+		for k := 0; k < len(buffers); k++ {
+			// Verify sync is not prematurely closing.
+			if s.isClosing() {
+				return nil
+			}
 
-		// Execute query.
-		_, err := clients[i].ExecuteQuery(context.Background(), f.Index(), buf.String(), false)
-		if err != nil {
-			return err
+			// Execute query.
+			queryRequest := &internal.QueryRequest{
+				Query:  buffers[k].String(),
+				Remote: true,
+			}
+			_, err := clients[i].ExecuteQuery(context.Background(), f.Index(), queryRequest)
+			if err != nil {
+				return err
+			}
 		}
 	}
 

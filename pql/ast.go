@@ -161,18 +161,13 @@ func (c *Call) String() string {
 		if i > 0 {
 			buf.WriteString(", ")
 		}
-
+		// If the Arg value is a Condition, then don't include
+		// the equal sign in the string representation.
 		switch v := c.Args[key].(type) {
-		case string:
-			fmt.Fprintf(&buf, "%v=%q", key, v)
-		case []interface{}:
-			fmt.Fprintf(&buf, "%v=%s", key, joinInterfaceSlice(v))
-		case []uint64:
-			fmt.Fprintf(&buf, "%v=%s", key, joinUint64Slice(v))
-		case time.Time:
-			fmt.Fprintf(&buf, "%v=\"%s\"", key, v.Format(TimeFormat))
+		case *Condition:
+			fmt.Fprintf(&buf, "%v %s", key, v.String())
 		default:
-			fmt.Fprintf(&buf, "%v=%v", key, v)
+			fmt.Fprintf(&buf, "%v=%s", key, FormatValue(v))
 		}
 	}
 
@@ -208,6 +203,70 @@ func (c *Call) IsInverse(rowLabel, columnLabel string) bool {
 		}
 	}
 	return false
+}
+
+// HasConditionArg returns true if any arg is a conditional.
+func (c *Call) HasConditionArg() bool {
+	for _, v := range c.Args {
+		if _, ok := v.(*Condition); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// Condition represents an operation & value.
+// When used in an argument map it represents a binary expression.
+type Condition struct {
+	Op    Token
+	Value interface{}
+}
+
+// String returns the string representation of the condition.
+func (cond *Condition) String() string {
+	return fmt.Sprintf("%s %s", cond.Op.String(), FormatValue(cond.Value))
+}
+
+// IntSliceValue reads cond.Value as a slice of uint64.
+// If the value is a slice of uint64 it will convert
+// it to []int64. Otherwise, if it is not a []int64 it will return an error.
+func (cond *Condition) IntSliceValue() ([]int64, error) {
+	val := cond.Value
+
+	switch tval := val.(type) {
+	case []interface{}:
+		ret := make([]int64, len(tval))
+		for i, v := range tval {
+			switch tv := v.(type) {
+			case int64:
+				ret[i] = tv
+			case uint64:
+				ret[i] = int64(tv)
+			default:
+				return nil, fmt.Errorf("unexpected value type %T in IntSliceValue, val %v", tv, tv)
+			}
+		}
+		return ret, nil
+	default:
+		return nil, fmt.Errorf("unexpected type %T in IntSliceValue, val %v", tval, tval)
+	}
+}
+
+func FormatValue(v interface{}) string {
+	switch v := v.(type) {
+	case string:
+		return fmt.Sprintf("%q", v)
+	case []interface{}:
+		return fmt.Sprintf("%s", joinInterfaceSlice(v))
+	case []uint64:
+		return fmt.Sprintf("%s", joinUint64Slice(v))
+	case time.Time:
+		return fmt.Sprintf("\"%s\"", v.Format(TimeFormat))
+	case *Condition:
+		return v.String()
+	default:
+		return fmt.Sprintf("%v", v)
+	}
 }
 
 // CopyArgs returns a copy of m.

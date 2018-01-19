@@ -19,14 +19,19 @@ import (
 	"io"
 	"log"
 	"os"
-
-	"golang.org/x/sync/errgroup"
+	"strings"
+	"time"
 
 	"github.com/gogo/protobuf/proto"
 	"github.com/hashicorp/memberlist"
 	"github.com/pilosa/pilosa"
 	"github.com/pilosa/pilosa/internal"
 )
+
+// Ensure GossipNodeSet implements interfaces.
+var _ pilosa.BroadcastReceiver = &GossipNodeSet{}
+var _ pilosa.Gossiper = &GossipNodeSet{}
+var _ memberlist.Delegate = &GossipNodeSet{}
 
 // GossipNodeSet represents a gossip implementation of NodeSet using memberlist
 // GossipNodeSet also represents a gossip implementation of pilosa.Broadcaster
@@ -48,7 +53,7 @@ type GossipNodeSet struct {
 func (g *GossipNodeSet) Nodes() []*pilosa.Node {
 	a := make([]*pilosa.Node, 0, g.memberlist.NumMembers())
 	for _, n := range g.memberlist.Members() {
-		a = append(a, &pilosa.Node{Host: n.Name})
+		a = append(a, &pilosa.Node{Scheme: "gossip", Host: n.Name})
 	}
 	return a
 }
@@ -57,6 +62,11 @@ func (g *GossipNodeSet) Nodes() []*pilosa.Node {
 func (g *GossipNodeSet) Start(h pilosa.BroadcastHandler) error {
 	g.handler = h
 	return nil
+}
+
+// Seed returns the gossipSeed determined by the config.
+func (g *GossipNodeSet) Seed() string {
+	return g.config.gossipSeed
 }
 
 // Open implements the NodeSet interface to start network activity.
@@ -69,20 +79,45 @@ func (g *GossipNodeSet) Open() error {
 		return err
 	}
 	g.memberlist = ml
-
-	// attach to gossip seed node
-	nodes := []*pilosa.Node{&pilosa.Node{Host: g.config.gossipSeed}} //TODO: support a list of seeds
-	_, err = g.memberlist.Join(pilosa.Nodes(nodes).Hosts())
-	if err != nil {
-		return err
-	}
 	g.broadcasts = &memberlist.TransmitLimitedQueue{
 		NumNodes: func() int {
 			return ml.NumMembers()
 		},
 		RetransmitMult: 3,
 	}
+
+	// attach to gossip seed node
+	nodes := []*pilosa.Node{&pilosa.Node{Scheme: "gossip", Host: g.config.gossipSeed}} //TODO: support a list of seeds
+	err = g.joinWithRetry(pilosa.Nodes(nodes).Hosts())
+	if err != nil {
+		return err
+	}
 	return nil
+}
+
+// joinWithRetry wraps the standard memberlist Join function in a retry.
+func (g *GossipNodeSet) joinWithRetry(hosts []string) error {
+	err := retry(60, 2*time.Second, func() error {
+		_, err := g.memberlist.Join(hosts)
+		return err
+	})
+	return err
+}
+
+// retry periodically retries function fn a specified number of attempts.
+func retry(attempts int, sleep time.Duration, fn func() error) (err error) {
+	for i := 0; ; i++ {
+		err = fn()
+		if err == nil {
+			return
+		}
+		if i >= (attempts - 1) {
+			break
+		}
+		time.Sleep(sleep)
+		log.Println("retrying after error:", err)
+	}
+	return fmt.Errorf("after %d attempts, last error: %s", attempts, err)
 }
 
 // logger returns a logger for the GossipNodeSet.
@@ -97,58 +132,112 @@ type gossipConfig struct {
 	memberlistConfig *memberlist.Config
 }
 
-// NewGossipNodeSet returns a new instance of GossipNodeSet.
-func NewGossipNodeSet(name string, gossipHost string, gossipPort int, gossipSeed string, sh pilosa.StatusHandler) *GossipNodeSet {
-	g := &GossipNodeSet{
-		LogOutput: os.Stderr,
+// newTransport returns a NetTransport based on the memberlist configuration.
+// It will dynamically bind to a port if conf.BindPort is 0.
+// This is useful for test cases where specifiying a port is not reasonable.
+func newTransport(conf *memberlist.Config) (*memberlist.NetTransport, error) {
+	if conf.LogOutput != nil && conf.Logger != nil {
+		return nil, fmt.Errorf("Cannot specify both LogOutput and Logger. Please choose a single log configuration setting.")
 	}
+
+	logDest := conf.LogOutput
+	if logDest == nil {
+		logDest = os.Stderr
+	}
+
+	logger := conf.Logger
+	if logger == nil {
+		logger = log.New(logDest, "", log.LstdFlags)
+	}
+
+	nc := &memberlist.NetTransportConfig{
+		BindAddrs: []string{conf.BindAddr},
+		BindPort:  conf.BindPort,
+		Logger:    logger,
+	}
+
+	// See comment below for details about the retry in here.
+	makeNetRetry := func(limit int) (*memberlist.NetTransport, error) {
+		var err error
+		for try := 0; try < limit; try++ {
+			var nt *memberlist.NetTransport
+			if nt, err = memberlist.NewNetTransport(nc); err == nil {
+				return nt, nil
+			}
+			if strings.Contains(err.Error(), "address already in use") {
+				logger.Printf("[DEBUG] Got bind error: %v", err)
+				continue
+			}
+		}
+
+		return nil, fmt.Errorf("failed to obtain an address: %v", err)
+	}
+
+	// The dynamic bind port operation is inherently racy because
+	// even though we are using the kernel to find a port for us, we
+	// are attempting to bind multiple protocols (and potentially
+	// multiple addresses) with the same port number. We build in a
+	// few retries here since this often gets transient errors in
+	// busy unit tests.
+	limit := 1
+	if conf.BindPort == 0 {
+		limit = 10
+	}
+
+	nt, err := makeNetRetry(limit)
+	if err != nil {
+		return nil, fmt.Errorf("Could not set up network transport: %v", err)
+	}
+	if conf.BindPort == 0 {
+		port := nt.GetAutoBindPort()
+		conf.BindPort = port
+		conf.AdvertisePort = port
+		logger.Printf("[DEBUG] Using dynamic bind port %d", port)
+	}
+
+	return nt, nil
+}
+
+// NewGossipNodeSet returns a new instance of GossipNodeSet.
+func NewGossipNodeSet(name string, gossipHost string, gossipPort int, gossipSeed string, server *pilosa.Server, secretKey []byte) (*GossipNodeSet, error) {
+	g := &GossipNodeSet{
+		LogOutput: server.LogOutput,
+	}
+
+	conf := memberlist.DefaultLocalConfig()
+	conf.BindPort = gossipPort
+	conf.AdvertisePort = gossipPort
 
 	//TODO: pull memberlist config from pilosa.cfg file
 	g.config = &gossipConfig{
-		memberlistConfig: memberlist.DefaultLocalConfig(),
+		memberlistConfig: conf,
 		gossipSeed:       gossipSeed,
 	}
+
 	g.config.memberlistConfig.Name = name
 	g.config.memberlistConfig.BindAddr = gossipHost
-	g.config.memberlistConfig.BindPort = gossipPort
-	g.config.memberlistConfig.AdvertiseAddr = gossipHost
-	g.config.memberlistConfig.AdvertisePort = gossipPort
+	g.config.memberlistConfig.AdvertiseAddr = pilosa.HostToIP(gossipHost)
 	g.config.memberlistConfig.Delegate = g
+	g.config.memberlistConfig.SecretKey = secretKey
 
-	g.statusHandler = sh
+	g.statusHandler = server
 
-	return g
-}
-
-// SendSync implementation of the Broadcaster interface.
-func (g *GossipNodeSet) SendSync(pb proto.Message) error {
-	msg, err := pilosa.MarshalMessage(pb)
+	// set up the transport
+	transport, err := newTransport(g.config.memberlistConfig)
 	if err != nil {
-		return err
+		return nil, err
+	}
+	g.config.memberlistConfig.Transport = transport
+
+	// If no gossipSeed is provided, use local host:port.
+	if gossipSeed == "" {
+		g.config.gossipSeed = fmt.Sprintf("%s:%d", gossipHost, g.config.memberlistConfig.BindPort)
 	}
 
-	mlist := g.memberlist
-
-	// Direct sends the message directly to every node.
-	// An error from any node raises an error on the entire operation.
-	//
-	// Gossip uses the gossip protocol to eventually deliver the message
-	// to every node.
-	var eg errgroup.Group
-	for _, n := range mlist.Members() {
-		// Don't send the message to the local node.
-		if n == mlist.LocalNode() {
-			continue
-		}
-		node := n
-		eg.Go(func() error {
-			return mlist.SendToTCP(node, msg)
-		})
-	}
-	return eg.Wait()
+	return g, nil
 }
 
-// SendAsync implementation of the Broadcaster interface.
+// SendAsync implementation of the Gossiper interface.
 func (g *GossipNodeSet) SendAsync(pb proto.Message) error {
 	msg, err := pilosa.MarshalMessage(pb)
 	if err != nil {

@@ -97,6 +97,26 @@ func (b *Bitmap) Intersect(other *Bitmap) *Bitmap {
 	return &Bitmap{segments: segments}
 }
 
+// Xor returns the xor of b and other.
+func (b *Bitmap) Xor(other *Bitmap) *Bitmap {
+	var segments []BitmapSegment
+
+	itr := newMergeSegmentIterator(b.segments, other.segments)
+	for s0, s1 := itr.next(); s0 != nil || s1 != nil; s0, s1 = itr.next() {
+		if s1 == nil {
+			segments = append(segments, *s0)
+			continue
+		} else if s0 == nil {
+			segments = append(segments, *s1)
+			continue
+		}
+
+		segments = append(segments, *s0.Xor(s1))
+	}
+
+	return &Bitmap{segments: segments}
+}
+
 // Union returns the bitwise union of b and other.
 func (b *Bitmap) Union(other *Bitmap) *Bitmap {
 	var segments []BitmapSegment
@@ -169,11 +189,12 @@ func (b *Bitmap) createSegmentIfNotExists(slice uint64) *BitmapSegment {
 	}
 
 	// Insert new segment.
-	b.segments = append(b.segments, BitmapSegment{})
+	b.segments = append(b.segments, BitmapSegment{data: *roaring.NewBitmap()})
 	if i < len(b.segments) {
 		copy(b.segments[i+1:], b.segments[i:])
 	}
 	b.segments[i] = BitmapSegment{
+		data:     *roaring.NewBitmap(),
 		slice:    slice,
 		writable: true,
 	}
@@ -334,6 +355,17 @@ func (s *BitmapSegment) Union(other *BitmapSegment) *BitmapSegment {
 // Difference returns the diff of s and other.
 func (s *BitmapSegment) Difference(other *BitmapSegment) *BitmapSegment {
 	data := s.data.Difference(&other.data)
+
+	return &BitmapSegment{
+		data:  *data,
+		slice: s.slice,
+		n:     data.Count(),
+	}
+}
+
+// Xor returns the xor of s and other.
+func (s *BitmapSegment) Xor(other *BitmapSegment) *BitmapSegment {
+	data := s.data.Xor(&other.data)
 
 	return &BitmapSegment{
 		data:  *data,

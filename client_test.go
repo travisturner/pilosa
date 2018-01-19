@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net/http"
 	"reflect"
 	"testing"
 
@@ -25,16 +26,17 @@ import (
 	"github.com/pilosa/pilosa"
 	"github.com/pilosa/pilosa/internal"
 	"github.com/pilosa/pilosa/pql"
+	"github.com/pilosa/pilosa/test"
 )
 
-func createCluster(c *pilosa.Cluster) ([]*Server, []*Holder) {
+func createCluster(c *pilosa.Cluster) ([]*test.Server, []*test.Holder) {
 	numNodes := len(c.Nodes)
-	hldr := make([]*Holder, numNodes)
-	server := make([]*Server, numNodes)
+	hldr := make([]*test.Holder, numNodes)
+	server := make([]*test.Server, numNodes)
 	for i := 0; i < numNodes; i++ {
-		hldr[i] = MustOpenHolder()
-		server[i] = NewServer()
-		server[i].Handler.Host = server[i].Host()
+		hldr[i] = test.MustOpenHolder()
+		server[i] = test.NewServer()
+		server[i].Handler.URI = server[i].HostURI()
 		server[i].Handler.Cluster = c
 		server[i].Handler.Cluster.Nodes[i].Host = server[i].Host()
 		server[i].Handler.Holder = hldr[i].Holder
@@ -42,9 +44,16 @@ func createCluster(c *pilosa.Cluster) ([]*Server, []*Holder) {
 	return server, hldr
 }
 
+var defaultClient *http.Client
+
+func init() {
+	defaultClient = pilosa.GetHTTPClient(nil)
+
+}
+
 // Test distributed TopN Row count across 3 nodes.
 func TestClient_MultiNode(t *testing.T) {
-	cluster := NewCluster(3)
+	cluster := test.NewCluster(3)
 	s, hldr := createCluster(cluster)
 
 	for i := 0; i < len(cluster.Nodes); i++ {
@@ -53,22 +62,25 @@ func TestClient_MultiNode(t *testing.T) {
 	}
 
 	s[0].Handler.Executor.ExecuteFn = func(ctx context.Context, index string, query *pql.Query, slices []uint64, opt *pilosa.ExecOptions) ([]interface{}, error) {
-		e := pilosa.NewExecutor()
+		e := pilosa.NewExecutor(defaultClient)
 		e.Holder = hldr[0].Holder
+		e.Scheme = cluster.Nodes[0].Scheme
 		e.Host = cluster.Nodes[0].Host
 		e.Cluster = cluster
 		return e.Execute(ctx, index, query, slices, opt)
 	}
 	s[1].Handler.Executor.ExecuteFn = func(ctx context.Context, index string, query *pql.Query, slices []uint64, opt *pilosa.ExecOptions) ([]interface{}, error) {
-		e := pilosa.NewExecutor()
+		e := pilosa.NewExecutor(defaultClient)
 		e.Holder = hldr[1].Holder
+		e.Scheme = cluster.Nodes[1].Scheme
 		e.Host = cluster.Nodes[1].Host
 		e.Cluster = cluster
 		return e.Execute(ctx, index, query, slices, opt)
 	}
 	s[2].Handler.Executor.ExecuteFn = func(ctx context.Context, index string, query *pql.Query, slices []uint64, opt *pilosa.ExecOptions) ([]interface{}, error) {
-		e := pilosa.NewExecutor()
+		e := pilosa.NewExecutor(defaultClient)
 		e.Holder = hldr[2].Holder
+		e.Scheme = cluster.Nodes[2].Scheme
 		e.Host = cluster.Nodes[2].Host
 		e.Cluster = cluster
 		return e.Execute(ctx, index, query, slices, opt)
@@ -86,7 +98,7 @@ func TestClient_MultiNode(t *testing.T) {
 			}
 		}
 		if !ownsNum {
-			t.Fatalf("Trying to use slice %d on host %s, but it doesn't own that slice. It owns %s", num, s[i].Host(), owns)
+			t.Fatalf("Trying to use slice %d on host %s, but it doesn't own that slice. It owns %v", num, s[i].Host(), owns)
 		}
 	}
 
@@ -130,21 +142,23 @@ func TestClient_MultiNode(t *testing.T) {
 	hldr[2].MustCreateRankedFragmentIfNotExists("i", "f", pilosa.ViewStandard, sliceNums[2]).RecalculateCache()
 
 	// Connect to each node to compare results.
-	client := make([]*Client, 3)
-	client[0] = MustNewClient(s[0].Host())
-	client[1] = MustNewClient(s[1].Host())
-	client[2] = MustNewClient(s[2].Host())
+	client := make([]*test.Client, 3)
+	client[0] = test.MustNewClient(s[0].Host(), defaultClient)
+	client[1] = test.MustNewClient(s[1].Host(), defaultClient)
+	client[2] = test.MustNewClient(s[2].Host(), defaultClient)
 
 	topN := 4
-	q := fmt.Sprintf(`TopN(frame="%s", n=%d)`, "f", topN)
-
-	result, err := client[0].ExecuteQuery(context.Background(), "i", q, true)
+	queryRequest := &internal.QueryRequest{
+		Query:  fmt.Sprintf(`TopN(frame="%s", n=%d)`, "f", topN),
+		Remote: false,
+	}
+	result, err := client[0].ExecuteQuery(context.Background(), "i", queryRequest)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// Check the results before every node has the correct max slice value.
-	pairs := result.(internal.QueryResponse).Results[0].Pairs
+	pairs := result.Results[0].Pairs
 	for _, pair := range pairs {
 		if pair.Key == 22 && pair.Count != 3 {
 			t.Fatalf("Invalid Cluster wide MaxSlice prevents accurate calculation of %s", pair)
@@ -156,13 +170,13 @@ func TestClient_MultiNode(t *testing.T) {
 	hldr[1].Index("i").SetRemoteMaxSlice(maxSlice)
 	hldr[2].Index("i").SetRemoteMaxSlice(maxSlice)
 
-	result, err = client[0].ExecuteQuery(context.Background(), "i", q, true)
+	result, err = client[0].ExecuteQuery(context.Background(), "i", queryRequest)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// Test must return exactly N results.
-	if len(result.(internal.QueryResponse).Results[0].Pairs) != topN {
+	if len(result.Results[0].Pairs) != topN {
 		t.Fatalf("unexpected number of TopN results: %s", spew.Sdump(result))
 	}
 	p := []*internal.Pair{
@@ -172,15 +186,15 @@ func TestClient_MultiNode(t *testing.T) {
 		{Key: 99, Count: 7}}
 
 	// Valdidate the Top 4 result counts.
-	if !reflect.DeepEqual(result.(internal.QueryResponse).Results[0].Pairs, p) {
+	if !reflect.DeepEqual(result.Results[0].Pairs, p) {
 		t.Fatalf("Invalid TopN result set: %s", spew.Sdump(result))
 	}
 
-	result1, err := client[1].ExecuteQuery(context.Background(), "i", q, true)
+	result1, err := client[1].ExecuteQuery(context.Background(), "i", queryRequest)
 	if err != nil {
 		t.Fatal(err)
 	}
-	result2, err := client[2].ExecuteQuery(context.Background(), "i", q, true)
+	result2, err := client[2].ExecuteQuery(context.Background(), "i", queryRequest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,22 +211,22 @@ func TestClient_MultiNode(t *testing.T) {
 
 // Ensure client can bulk import data.
 func TestClient_Import(t *testing.T) {
-	hldr := MustOpenHolder()
+	hldr := test.MustOpenHolder()
 	defer hldr.Close()
 
 	// Load bitmap into cache to ensure cache gets updated.
 	f := hldr.MustCreateFragmentIfNotExists("i", "f", pilosa.ViewStandard, 0)
 	f.Row(0)
 
-	s := NewServer()
+	s := test.NewServer()
 	defer s.Close()
-	s.Handler.Host = s.Host()
-	s.Handler.Cluster = NewCluster(1)
+	s.Handler.URI = s.HostURI()
+	s.Handler.Cluster = test.NewCluster(1)
 	s.Handler.Cluster.Nodes[0].Host = s.Host()
 	s.Handler.Holder = hldr.Holder
 
 	// Send import request.
-	c := MustNewClient(s.Host())
+	c := test.MustNewClient(s.Host(), defaultClient)
 	if err := c.Import(context.Background(), "i", "f", 0, []pilosa.Bit{
 		{RowID: 0, ColumnID: 1},
 		{RowID: 0, ColumnID: 5},
@@ -232,7 +246,7 @@ func TestClient_Import(t *testing.T) {
 
 // Ensure client can bulk import data to an inverse frame.
 func TestClient_ImportInverseEnabled(t *testing.T) {
-	hldr := MustOpenHolder()
+	hldr := test.MustOpenHolder()
 	defer hldr.Close()
 
 	idx := hldr.MustCreateIndexIfNotExists("i", pilosa.IndexOptions{})
@@ -255,15 +269,15 @@ func TestClient_ImportInverseEnabled(t *testing.T) {
 	// Load bitmap into cache to ensure cache gets updated.
 	f.Row(0)
 
-	s := NewServer()
+	s := test.NewServer()
 	defer s.Close()
-	s.Handler.Host = s.Host()
-	s.Handler.Cluster = NewCluster(1)
+	s.Handler.URI = s.HostURI()
+	s.Handler.Cluster = test.NewCluster(1)
 	s.Handler.Cluster.Nodes[0].Host = s.Host()
 	s.Handler.Holder = hldr.Holder
 
 	// Send import request.
-	c := MustNewClient(s.Host())
+	c := test.MustNewClient(s.Host(), defaultClient)
 	if err := c.Import(context.Background(), "i", "f", 0, []pilosa.Bit{
 		{RowID: 0, ColumnID: 1},
 		{RowID: 0, ColumnID: 5},
@@ -285,9 +299,56 @@ func TestClient_ImportInverseEnabled(t *testing.T) {
 	}
 }
 
+// Ensure client can bulk import value data.
+func TestClient_ImportValue(t *testing.T) {
+	hldr := test.MustOpenHolder()
+	defer hldr.Close()
+
+	fld := pilosa.Field{
+		Name: "fld",
+		Type: pilosa.FieldTypeInt,
+		Min:  -100,
+		Max:  100,
+	}
+
+	// Load bitmap into cache to ensure cache gets updated.
+	index := hldr.MustCreateIndexIfNotExists("i", pilosa.IndexOptions{})
+	frame, err := index.CreateFrameIfNotExists("f", pilosa.FrameOptions{RangeEnabled: true, Fields: []*pilosa.Field{&fld}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := test.NewServer()
+	defer s.Close()
+	s.Handler.URI = s.HostURI()
+	s.Handler.Cluster = test.NewCluster(1)
+	s.Handler.Cluster.Nodes[0].Host = s.Host()
+	s.Handler.Holder = hldr.Holder
+
+	// Send import request.
+	c := test.MustNewClient(s.Host(), defaultClient)
+	if err := c.ImportValue(context.Background(), "i", "f", fld.Name, 0, []pilosa.FieldValue{
+		{ColumnID: 1, Value: -10},
+		{ColumnID: 2, Value: 20},
+		{ColumnID: 3, Value: 40},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	sum, cnt, err := frame.FieldSum(nil, fld.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify data.
+	if sum != 50 || cnt != 3 {
+		t.Fatalf("unexpected values: got sum=%v, count=%v; expected sum=70, cnt=3", sum, cnt)
+	}
+}
+
 // Ensure client backup and restore a frame.
 func TestClient_BackupRestore(t *testing.T) {
-	hldr := MustOpenHolder()
+	hldr := test.MustOpenHolder()
 	defer hldr.Close()
 
 	hldr.MustCreateFragmentIfNotExists("i", "f", pilosa.ViewStandard, 0).MustSetBits(100, 1, 2, 3, SliceWidth-1)
@@ -295,14 +356,14 @@ func TestClient_BackupRestore(t *testing.T) {
 	hldr.MustCreateFragmentIfNotExists("i", "f", pilosa.ViewStandard, 5).MustSetBits(100, (5*SliceWidth)+1)
 	hldr.MustCreateFragmentIfNotExists("i", "f", pilosa.ViewStandard, 0).MustSetBits(200, 20000)
 
-	s := NewServer()
+	s := test.NewServer()
 	defer s.Close()
-	s.Handler.Host = s.Host()
-	s.Handler.Cluster = NewCluster(1)
+	s.Handler.URI = s.HostURI()
+	s.Handler.Cluster = test.NewCluster(1)
 	s.Handler.Cluster.Nodes[0].Host = s.Host()
 	s.Handler.Holder = hldr.Holder
 
-	c := MustNewClient(s.Host())
+	c := test.MustNewClient(s.Host(), defaultClient)
 
 	// Backup from frame.
 	var buf bytes.Buffer
@@ -335,7 +396,7 @@ func TestClient_BackupRestore(t *testing.T) {
 
 // Ensure client backup and restore a frame with inverse view.
 func TestClient_BackupInverseView(t *testing.T) {
-	hldr := MustOpenHolder()
+	hldr := test.MustOpenHolder()
 	defer hldr.Close()
 
 	idx := hldr.MustCreateIndexIfNotExists("i", pilosa.IndexOptions{})
@@ -360,14 +421,14 @@ func TestClient_BackupInverseView(t *testing.T) {
 	f.SetBit(100, 3)
 	f.SetBit(100, SliceWidth-1)
 
-	s := NewServer()
+	s := test.NewServer()
 	defer s.Close()
-	s.Handler.Host = s.Host()
-	s.Handler.Cluster = NewCluster(1)
+	s.Handler.URI = s.HostURI()
+	s.Handler.Cluster = test.NewCluster(1)
 	s.Handler.Cluster.Nodes[0].Host = s.Host()
 	s.Handler.Holder = hldr.Holder
 
-	c := MustNewClient(s.Host())
+	c := test.MustNewClient(s.Host(), defaultClient)
 
 	// Backup from frame.
 	var buf bytes.Buffer
@@ -392,19 +453,19 @@ func TestClient_BackupInverseView(t *testing.T) {
 
 // backup returns error with invalid view
 func TestClient_BackupInvalidView(t *testing.T) {
-	hldr := MustOpenHolder()
+	hldr := test.MustOpenHolder()
 	defer hldr.Close()
 
 	hldr.MustCreateFragmentIfNotExists("i", "f", pilosa.ViewStandard, 0).MustSetBits(100, 1, 2, 3, SliceWidth-1)
 
-	s := NewServer()
+	s := test.NewServer()
 	defer s.Close()
-	s.Handler.Host = s.Host()
-	s.Handler.Cluster = NewCluster(1)
+	s.Handler.URI = s.HostURI()
+	s.Handler.Cluster = test.NewCluster(1)
 	s.Handler.Cluster.Nodes[0].Host = s.Host()
 	s.Handler.Holder = hldr.Holder
 
-	c := MustNewClient(s.Host())
+	c := test.MustNewClient(s.Host(), defaultClient)
 
 	// Backup from frame.
 	var buf bytes.Buffer
@@ -416,7 +477,7 @@ func TestClient_BackupInvalidView(t *testing.T) {
 
 // Ensure client can retrieve a list of all checksums for blocks in a fragment.
 func TestClient_FragmentBlocks(t *testing.T) {
-	hldr := MustOpenHolder()
+	hldr := test.MustOpenHolder()
 	defer hldr.Close()
 
 	// Set two bits on blocks 0 & 3.
@@ -426,15 +487,15 @@ func TestClient_FragmentBlocks(t *testing.T) {
 	// Set a bit on a different slice.
 	hldr.MustCreateFragmentIfNotExists("i", "f", pilosa.ViewStandard, 1).SetBit(0, 1)
 
-	s := NewServer()
+	s := test.NewServer()
 	defer s.Close()
-	s.Handler.Host = s.Host()
-	s.Handler.Cluster = NewCluster(1)
+	s.Handler.URI = s.HostURI()
+	s.Handler.Cluster = test.NewCluster(1)
 	s.Handler.Cluster.Nodes[0].Host = s.Host()
 	s.Handler.Holder = hldr.Holder
 
 	// Retrieve blocks.
-	c := MustNewClient(s.Host())
+	c := test.MustNewClient(s.Host(), defaultClient)
 	blocks, err := c.FragmentBlocks(context.Background(), "i", "f", pilosa.ViewStandard, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -450,18 +511,4 @@ func TestClient_FragmentBlocks(t *testing.T) {
 	if a := hldr.Fragment("i", "f", pilosa.ViewStandard, 0).Blocks(); !reflect.DeepEqual(a, blocks) {
 		t.Fatalf("blocks mismatch:\n\nexp=%s\n\ngot=%s\n\n", spew.Sdump(a), spew.Sdump(blocks))
 	}
-}
-
-// Client represents a test wrapper for pilosa.Client.
-type Client struct {
-	*pilosa.Client
-}
-
-// MustNewClient returns a new instance of Client. Panic on error.
-func MustNewClient(host string) *Client {
-	c, err := pilosa.NewClient(host)
-	if err != nil {
-		panic(err)
-	}
-	return &Client{Client: c}
 }

@@ -27,8 +27,10 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
+	// Imported for its side-effect of registering pprof endpoints with the server.
 	_ "net/http/pprof"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -42,19 +44,22 @@ import (
 
 	"unicode"
 
+	// Allow building Pilosa without the web UI.
 	_ "github.com/pilosa/pilosa/statik"
 	"github.com/rakyll/statik/fs"
 )
 
 // Handler represents an HTTP handler.
 type Handler struct {
-	Holder        *Holder
-	Broadcaster   Broadcaster
-	StatusHandler StatusHandler
+	Holder           *Holder
+	Broadcaster      Broadcaster
+	BroadcastHandler BroadcastHandler
+	StatusHandler    StatusHandler
 
 	// Local hostname & cluster configuration.
-	Host    string
-	Cluster *Cluster
+	URI          *URI
+	Cluster      *Cluster
+	RemoteClient *http.Client
 
 	Router *mux.Router
 
@@ -94,20 +99,6 @@ func NewRouter(handler *Handler) *mux.Router {
 	router := mux.NewRouter()
 	router.HandleFunc("/", handler.handleWebUI).Methods("GET")
 	router.HandleFunc("/assets/{file}", handler.handleWebUI).Methods("GET")
-	router.HandleFunc("/index", handler.handleGetIndexes).Methods("GET")
-	router.HandleFunc("/index/{index}", handler.handleGetIndex).Methods("GET")
-	router.HandleFunc("/index/{index}", handler.handlePostIndex).Methods("POST")
-	router.HandleFunc("/index/{index}", handler.handleDeleteIndex).Methods("DELETE")
-	router.HandleFunc("/index/{index}/attr/diff", handler.handlePostIndexAttrDiff).Methods("POST")
-	//router.HandleFunc("/index/{index}/frame", handler.handleGetFrames).Methods("GET") // Not implemented.
-	router.HandleFunc("/index/{index}/frame/{frame}", handler.handlePostFrame).Methods("POST")
-	router.HandleFunc("/index/{index}/frame/{frame}", handler.handleDeleteFrame).Methods("DELETE")
-	router.HandleFunc("/index/{index}/query", handler.handlePostQuery).Methods("POST")
-	router.HandleFunc("/index/{index}/frame/{frame}/attr/diff", handler.handlePostFrameAttrDiff).Methods("POST")
-	router.HandleFunc("/index/{index}/frame/{frame}/restore", handler.handlePostFrameRestore).Methods("POST")
-	router.HandleFunc("/index/{index}/frame/{frame}/time-quantum", handler.handlePatchFrameTimeQuantum).Methods("PATCH")
-	router.HandleFunc("/index/{index}/frame/{frame}/views", handler.handleGetFrameViews).Methods("GET")
-	router.HandleFunc("/index/{index}/time-quantum", handler.handlePatchIndexTimeQuantum).Methods("PATCH")
 	router.PathPrefix("/debug/pprof/").Handler(http.DefaultServeMux).Methods("GET")
 	router.HandleFunc("/debug/vars", handler.handleExpvar).Methods("GET")
 	router.HandleFunc("/export", handler.handleGetExport).Methods("GET")
@@ -117,11 +108,37 @@ func NewRouter(handler *Handler) *mux.Router {
 	router.HandleFunc("/fragment/data", handler.handlePostFragmentData).Methods("POST")
 	router.HandleFunc("/fragment/nodes", handler.handleGetFragmentNodes).Methods("GET")
 	router.HandleFunc("/import", handler.handlePostImport).Methods("POST")
+	router.HandleFunc("/import-value", handler.handlePostImportValue).Methods("POST")
+	router.HandleFunc("/index", handler.handleGetIndexes).Methods("GET")
+	router.HandleFunc("/index/{index}", handler.handleGetIndex).Methods("GET")
+	router.HandleFunc("/index/{index}", handler.handlePostIndex).Methods("POST")
+	router.HandleFunc("/index/{index}", handler.handleDeleteIndex).Methods("DELETE")
+	router.HandleFunc("/index/{index}/attr/diff", handler.handlePostIndexAttrDiff).Methods("POST")
+	//router.HandleFunc("/index/{index}/frame", handler.handleGetFrames).Methods("GET") // Not implemented.
+	router.HandleFunc("/index/{index}/frame/{frame}", handler.handlePostFrame).Methods("POST")
+	router.HandleFunc("/index/{index}/frame/{frame}", handler.handleDeleteFrame).Methods("DELETE")
+	router.HandleFunc("/index/{index}/frame/{frame}/attr/diff", handler.handlePostFrameAttrDiff).Methods("POST")
+	router.HandleFunc("/index/{index}/frame/{frame}/restore", handler.handlePostFrameRestore).Methods("POST")
+	router.HandleFunc("/index/{index}/frame/{frame}/time-quantum", handler.handlePatchFrameTimeQuantum).Methods("PATCH")
+	router.HandleFunc("/index/{index}/frame/{frame}/field/{field}", handler.handlePostFrameField).Methods("POST")
+	router.HandleFunc("/index/{index}/frame/{frame}/fields", handler.handleGetFrameFields).Methods("GET")
+	router.HandleFunc("/index/{index}/frame/{frame}/field/{field}", handler.handleDeleteFrameField).Methods("DELETE")
+	router.HandleFunc("/index/{index}/frame/{frame}/views", handler.handleGetFrameViews).Methods("GET")
+	router.HandleFunc("/index/{index}/frame/{frame}/view/{view}", handler.handleDeleteView).Methods("DELETE")
+	router.HandleFunc("/index/{index}/input/{input-definition}", handler.handlePostInput).Methods("POST")
+	router.HandleFunc("/index/{index}/input-definition/{input-definition}", handler.handleGetInputDefinition).Methods("GET")
+	router.HandleFunc("/index/{index}/input-definition/{input-definition}", handler.handlePostInputDefinition).Methods("POST")
+	router.HandleFunc("/index/{index}/input-definition/{input-definition}", handler.handleDeleteInputDefinition).Methods("DELETE")
+	router.HandleFunc("/index/{index}/query", handler.handlePostQuery).Methods("POST")
+	router.HandleFunc("/index/{index}/time-quantum", handler.handlePatchIndexTimeQuantum).Methods("PATCH")
 	router.HandleFunc("/hosts", handler.handleGetHosts).Methods("GET")
 	router.HandleFunc("/schema", handler.handleGetSchema).Methods("GET")
 	router.HandleFunc("/slices/max", handler.handleGetSliceMax).Methods("GET")
 	router.HandleFunc("/status", handler.handleGetStatus).Methods("GET")
 	router.HandleFunc("/version", handler.handleGetVersion).Methods("GET")
+	router.HandleFunc("/recalculate-caches", handler.handleRecalculateCaches).Methods("POST")
+	router.HandleFunc("/cluster/message", handler.handlePostClusterMessage).Methods("POST")
+	router.HandleFunc("/id", handler.handleGetID).Methods("GET")
 
 	// TODO: Apply MethodNotAllowed statuses to all endpoints.
 	// Ideally this would be automatic, as described in this (wontfix) ticket:
@@ -138,6 +155,16 @@ func (h *Handler) methodNotAllowedHandler(w http.ResponseWriter, r *http.Request
 
 // ServeHTTP handles an HTTP request.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	defer func() {
+		if err := recover(); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			stack := debug.Stack()
+			msg := "PANIC: %s\n%s"
+			fmt.Fprintf(h.LogOutput, msg, err, stack)
+			fmt.Fprintf(w, msg, err, stack)
+		}
+	}()
+
 	t := time.Now()
 	h.Router.ServeHTTP(w, r)
 	dif := time.Since(t)
@@ -147,7 +174,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		statsTags := make([]string, 0, 3)
 
 		if h.Cluster.LongQueryTime > 0 && dif > h.Cluster.LongQueryTime {
-			h.logger().Printf("%s %s %.03fs", r.Method, r.URL.String(), float64(dif))
+			h.logger().Printf("%s %s %v", r.Method, r.URL.String(), dif)
 			statsTags = append(statsTags, "slow_query")
 		}
 
@@ -226,7 +253,9 @@ func (h *Handler) handlePostQuery(w http.ResponseWriter, r *http.Request) {
 
 	// Build execution options.
 	opt := &ExecOptions{
-		Remote: req.Remote,
+		Remote:       req.Remote,
+		ExcludeAttrs: req.ExcludeAttrs,
+		ExcludeBits:  req.ExcludeBits,
 	}
 
 	// Parse query string.
@@ -242,7 +271,7 @@ func (h *Handler) handlePostQuery(w http.ResponseWriter, r *http.Request) {
 	resp := &QueryResponse{Results: results, Err: err}
 
 	// Fill column attributes if requested.
-	if req.ColumnAttrs {
+	if req.ColumnAttrs && !req.ExcludeBits {
 		// Consolidate all column ids across all calls.
 		var columnIDs []uint64
 		for _, result := range results {
@@ -457,6 +486,8 @@ func (h *Handler) handlePostIndex(w http.ResponseWriter, r *http.Request) {
 		})
 	if err != nil {
 		h.logger().Printf("problem sending CreateIndex message: %s", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 
 	// Encode response.
@@ -749,6 +780,115 @@ type patchFrameTimeQuantumRequest struct {
 
 type patchFrameTimeQuantumResponse struct{}
 
+// handlePostFrameField handles POST /frame/field request.
+func (h *Handler) handlePostFrameField(w http.ResponseWriter, r *http.Request) {
+	indexName := mux.Vars(r)["index"]
+	frameName := mux.Vars(r)["frame"]
+	fieldName := mux.Vars(r)["field"]
+
+	// Decode request.
+	var req postFrameFieldRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Retrieve frame by name.
+	f := h.Holder.Frame(indexName, frameName)
+	if f == nil {
+		http.Error(w, ErrFrameNotFound.Error(), http.StatusNotFound)
+		return
+	}
+
+	// Create new field.
+	if err := f.CreateField(&Field{
+		Name: fieldName,
+		Type: req.Type,
+		Min:  req.Min,
+		Max:  req.Max,
+	}); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Encode response.
+	if err := json.NewEncoder(w).Encode(postFrameFieldResponse{}); err != nil {
+		h.logger().Printf("response encoding error: %s", err)
+	}
+}
+
+type postFrameFieldRequest struct {
+	Type string `json:"type,omitempty"`
+	Min  int64  `json:"min,omitempty"`
+	Max  int64  `json:"max,omitempty"`
+}
+
+type postFrameFieldResponse struct{}
+
+// handleDeleteFrameField handles DELETE /frame/field request.
+func (h *Handler) handleDeleteFrameField(w http.ResponseWriter, r *http.Request) {
+	indexName := mux.Vars(r)["index"]
+	frameName := mux.Vars(r)["frame"]
+	fieldName := mux.Vars(r)["field"]
+
+	// Retrieve frame by name.
+	f := h.Holder.Frame(indexName, frameName)
+	if f == nil {
+		http.Error(w, ErrFrameNotFound.Error(), http.StatusNotFound)
+		return
+	}
+
+	// Delete field.
+	if err := f.DeleteField(fieldName); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Encode response.
+	if err := json.NewEncoder(w).Encode(deleteFrameFieldResponse{}); err != nil {
+		h.logger().Printf("response encoding error: %s", err)
+	}
+}
+
+func (h *Handler) handleGetFrameFields(w http.ResponseWriter, r *http.Request) {
+	indexName := mux.Vars(r)["index"]
+	frameName := mux.Vars(r)["frame"]
+
+	index := h.Holder.index(indexName)
+	if index == nil {
+		http.Error(w, ErrIndexNotFound.Error(), http.StatusNotFound)
+		return
+	}
+
+	frame := index.frame(frameName)
+	if frame == nil {
+		http.Error(w, ErrFrameNotFound.Error(), http.StatusNotFound)
+		return
+	}
+
+	schema, err := frame.GetFields()
+	if err == ErrFrameFieldsNotAllowed {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	} else if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Encode response.
+	if err := json.NewEncoder(w).Encode(getFrameFieldsResponse{Fields: schema.Fields}); err != nil {
+		h.logger().Printf("response encoding error: %s", err)
+	}
+}
+
+type getFrameFieldsResponse struct {
+	Fields []*Field `json:"fields,omitempty"`
+}
+
+type deleteFrameFieldRequest struct{}
+
+type deleteFrameFieldResponse struct{}
+
 // handleGetFrameViews handles GET /frame/views request.
 func (h *Handler) handleGetFrameViews(w http.ResponseWriter, r *http.Request) {
 	indexName := mux.Vars(r)["index"]
@@ -773,6 +913,47 @@ func (h *Handler) handleGetFrameViews(w http.ResponseWriter, r *http.Request) {
 		h.logger().Printf("response encoding error: %s", err)
 	}
 }
+
+// handleDeleteView handles Delete /frame/view request.
+func (h *Handler) handleDeleteView(w http.ResponseWriter, r *http.Request) {
+	indexName := mux.Vars(r)["index"]
+	frameName := mux.Vars(r)["frame"]
+	viewName := mux.Vars(r)["view"]
+
+	// Retrieve frame.
+	f := h.Holder.Frame(indexName, frameName)
+	if f == nil {
+		http.Error(w, ErrFrameNotFound.Error(), http.StatusNotFound)
+		return
+	}
+
+	// Delete the view.
+	if err := f.DeleteView(viewName); err != nil {
+		// Ingore this error becuase views do not exist on all nodes due to slice distribution.
+		if err != ErrInvalidView {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+
+	// Send the delete view message to all nodes.
+	err := h.Broadcaster.SendSync(
+		&internal.DeleteViewMessage{
+			Index: indexName,
+			Frame: frameName,
+			View:  viewName,
+		})
+	if err != nil {
+		h.logger().Printf("problem sending DeleteView message: %s", err)
+	}
+
+	// Encode response.
+	if err := json.NewEncoder(w).Encode(deleteViewResponse{}); err != nil {
+		h.logger().Printf("response encoding error: %s", err)
+	}
+}
+
+type deleteViewResponse struct{}
 
 type getFrameViewsResponse struct {
 	Views []string `json:"views,omitempty"`
@@ -890,7 +1071,7 @@ func (h *Handler) readProtobufQueryRequest(r *http.Request) (*QueryRequest, erro
 func (h *Handler) readURLQueryRequest(r *http.Request) (*QueryRequest, error) {
 	q := r.URL.Query()
 	validQuery := validOptions(QueryRequest{})
-	for key, _ := range q {
+	for key := range q {
 		if _, ok := validQuery[key]; !ok {
 			return nil, errors.New("invalid query params")
 		}
@@ -909,21 +1090,12 @@ func (h *Handler) readURLQueryRequest(r *http.Request) (*QueryRequest, error) {
 		return nil, errors.New("invalid slice argument")
 	}
 
-	// Parse time granularity.
-	quantum := TimeQuantum("YMDH")
-	if s := q.Get("time_granularity"); s != "" {
-		v, err := ParseTimeQuantum(s)
-		if err != nil {
-			return nil, errors.New("invalid time granularity")
-		}
-		quantum = v
-	}
-
 	return &QueryRequest{
-		Query:       query,
-		Slices:      slices,
-		ColumnAttrs: q.Get("columnAttrs") == "true",
-		Quantum:     quantum,
+		Query:        query,
+		Slices:       slices,
+		ColumnAttrs:  q.Get("columnAttrs") == "true",
+		ExcludeAttrs: q.Get("excludeAttrs") == "true",
+		ExcludeBits:  q.Get("excludeBits") == "true",
 	}, nil
 }
 
@@ -1001,8 +1173,8 @@ func (h *Handler) handlePostImport(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validate that this handler owns the slice.
-	if !h.Cluster.OwnsFragment(h.Host, req.Index, req.Slice) {
-		mesg := fmt.Sprintf("host does not own slice %s-%s slice:%d", h.Host, req.Index, req.Slice)
+	if !h.Cluster.OwnsFragment(h.URI.HostPort(), req.Index, req.Slice) {
+		mesg := fmt.Sprintf("host does not own slice %s-%s slice:%d", h.URI, req.Index, req.Slice)
 		http.Error(w, mesg, http.StatusPreconditionFailed)
 		return
 	}
@@ -1045,6 +1217,76 @@ func (h *Handler) handlePostImport(w http.ResponseWriter, r *http.Request) {
 	w.Write(buf)
 }
 
+// handlePostImportValue handles /import-value requests.
+func (h *Handler) handlePostImportValue(w http.ResponseWriter, r *http.Request) {
+	// Verify that request is only communicating over protobufs.
+	if r.Header.Get("Content-Type") != "application/x-protobuf" {
+		http.Error(w, "Unsupported media type", http.StatusUnsupportedMediaType)
+		return
+	} else if r.Header.Get("Accept") != "application/x-protobuf" {
+		http.Error(w, "Not acceptable", http.StatusNotAcceptable)
+		return
+	}
+
+	// Read entire body.
+	body, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Marshal into request object.
+	var req internal.ImportValueRequest
+	if err := proto.Unmarshal(body, &req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Validate that this handler owns the slice.
+	if !h.Cluster.OwnsFragment(h.URI.HostPort(), req.Index, req.Slice) {
+		mesg := fmt.Sprintf("host does not own slice %s-%s slice:%d", h.URI, req.Index, req.Slice)
+		http.Error(w, mesg, http.StatusPreconditionFailed)
+		return
+	}
+
+	// Find the Index.
+	h.logger().Println("importing:", req.Index, req.Frame, req.Slice)
+	index := h.Holder.Index(req.Index)
+	if index == nil {
+		h.logger().Printf("fragment error: index=%s, frame=%s, slice=%d, err=%s", req.Index, req.Frame, req.Slice, ErrIndexNotFound.Error())
+		http.Error(w, ErrIndexNotFound.Error(), http.StatusNotFound)
+		return
+	}
+
+	// Retrieve frame.
+	f := index.Frame(req.Frame)
+	if f == nil {
+		h.logger().Printf("frame error: index=%s, frame=%s, slice=%d, err=%s", req.Index, req.Frame, req.Slice, ErrFrameNotFound.Error())
+		http.Error(w, ErrFrameNotFound.Error(), http.StatusNotFound)
+		return
+	}
+
+	// Import into fragment.
+	err = f.ImportValue(req.Field, req.ColumnIDs, req.Values)
+	if err != nil {
+		h.logger().Printf("import error: index=%s, frame=%s, slice=%d, field=%s, bits=%d, err=%s", req.Index, req.Frame, req.Slice, req.Field, len(req.ColumnIDs), err)
+		return
+	}
+
+	// Marshal response object.
+	buf, e := proto.Marshal(&internal.ImportResponse{Err: errorString(err)})
+	if e != nil {
+		http.Error(w, fmt.Sprintf("marshal import response: %s", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Write response.
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+	}
+	w.Write(buf)
+}
+
 // handleGetExport handles /export requests.
 func (h *Handler) handleGetExport(w http.ResponseWriter, r *http.Request) {
 	switch r.Header.Get("Accept") {
@@ -1067,8 +1309,8 @@ func (h *Handler) handleGetExportCSV(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validate that this handler owns the slice.
-	if !h.Cluster.OwnsFragment(h.Host, index, slice) {
-		mesg := fmt.Sprintf("host does not own slice %s-%s slice:%d", h.Host, index, slice)
+	if !h.Cluster.OwnsFragment(h.URI.HostPort(), index, slice) {
+		mesg := fmt.Sprintf("host does not own slice %s-%s slice:%d", h.URI, index, slice)
 		http.Error(w, mesg, http.StatusPreconditionFailed)
 		return
 	}
@@ -1255,20 +1497,21 @@ func (h *Handler) handlePostFrameRestore(w http.ResponseWriter, r *http.Request)
 	frameName := mux.Vars(r)["frame"]
 
 	q := r.URL.Query()
-	host := q.Get("host")
+	hostStr := q.Get("host")
 
 	// Validate query parameters.
-	if host == "" {
+	if hostStr == "" {
 		http.Error(w, "host required", http.StatusBadRequest)
 		return
 	}
 
-	// Create a client for the remote cluster.
-	client, err := NewClient(host)
+	host, err := NewURIFromAddress(hostStr)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		http.Error(w, err.Error(), http.StatusBadRequest)
 	}
+
+	// Create a client for the remote cluster.
+	client := NewInternalHTTPClientFromURI(host, h.RemoteClient)
 
 	// Determine the maximum number of slices.
 	maxSlices, err := client.MaxSliceByIndex(r.Context())
@@ -1294,7 +1537,7 @@ func (h *Handler) handlePostFrameRestore(w http.ResponseWriter, r *http.Request)
 	// Loop over each slice and import it if this node owns it.
 	for slice := uint64(0); slice <= maxSlices[indexName]; slice++ {
 		// Ignore this slice if we don't own it.
-		if !h.Cluster.OwnsFragment(h.Host, indexName, slice) {
+		if !h.Cluster.OwnsFragment(h.URI.HostPort(), indexName, slice) {
 			continue
 		}
 
@@ -1392,8 +1635,11 @@ type QueryRequest struct {
 	// Return column attributes, if true.
 	ColumnAttrs bool
 
-	// Time granularity to use with the timestamp.
-	Quantum TimeQuantum
+	// Do not return row attributes, if true.
+	ExcludeAttrs bool
+
+	// Do not return bits, if true.
+	ExcludeBits bool
 
 	// If true, indicates that query is part of a larger distributed query.
 	// If false, this request is on the originating node.
@@ -1402,11 +1648,12 @@ type QueryRequest struct {
 
 func decodeQueryRequest(pb *internal.QueryRequest) *QueryRequest {
 	req := &QueryRequest{
-		Query:       pb.Query,
-		Slices:      pb.Slices,
-		ColumnAttrs: pb.ColumnAttrs,
-		Quantum:     TimeQuantum(pb.Quantum),
-		Remote:      pb.Remote,
+		Query:        pb.Query,
+		Slices:       pb.Slices,
+		ColumnAttrs:  pb.ColumnAttrs,
+		Remote:       pb.Remote,
+		ExcludeAttrs: pb.ExcludeAttrs,
+		ExcludeBits:  pb.ExcludeBits,
 	}
 
 	return req
@@ -1455,6 +1702,8 @@ func encodeQueryResponse(resp *QueryResponse) *internal.QueryResponse {
 			pb.Results[i].Bitmap = encodeBitmap(result)
 		case []Pair:
 			pb.Results[i].Pairs = encodePairs(result)
+		case SumCount:
+			pb.Results[i].SumCount = encodeSumCount(result)
 		case uint64:
 			pb.Results[i].N = result
 		case bool:
@@ -1495,3 +1744,294 @@ func errorString(err error) string {
 	}
 	return err.Error()
 }
+
+// handlePostInputDefinition handles POST /input-definition request.
+func (h *Handler) handlePostInputDefinition(w http.ResponseWriter, r *http.Request) {
+	indexName := mux.Vars(r)["index"]
+	inputDefName := mux.Vars(r)["input-definition"]
+
+	// Find index.
+	index := h.Holder.Index(indexName)
+	if index == nil {
+		http.Error(w, ErrIndexNotFound.Error(), http.StatusNotFound)
+		return
+	}
+
+	// Decode request.
+	var req InputDefinitionInfo
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if err := req.Validate(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Encode InputDefinition to its internal representation.
+	def := req.Encode()
+	def.Name = inputDefName
+
+	// Create InputDefinition.
+	_, err = index.CreateInputDefinition(def)
+	if err == ErrInputDefinitionExists {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	} else if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	err = h.Broadcaster.SendSync(
+		&internal.CreateInputDefinitionMessage{
+			Index:      indexName,
+			Definition: def,
+		})
+	if err != nil {
+		h.logger().Printf("problem sending CreateInputDefinition message: %s", err)
+	}
+
+	if err := json.NewEncoder(w).Encode(defaultInputDefinitionResponse{}); err != nil {
+		h.logger().Printf("response encoding error: %s", err)
+	}
+}
+
+// handleGetInputDefinition handles GET /input-definition request.
+func (h *Handler) handleGetInputDefinition(w http.ResponseWriter, r *http.Request) {
+	indexName := mux.Vars(r)["index"]
+	inputDefName := mux.Vars(r)["input-definition"]
+
+	// Find index.
+	index := h.Holder.Index(indexName)
+	if index == nil {
+		http.Error(w, ErrIndexNotFound.Error(), http.StatusNotFound)
+		return
+	}
+
+	inputDef, err := index.InputDefinition(inputDefName)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+
+	if err = json.NewEncoder(w).Encode(InputDefinitionInfo{
+		Frames: inputDef.frames,
+		Fields: inputDef.fields,
+	}); err != nil {
+		h.logger().Printf("write status response error: %s", err)
+	}
+
+}
+
+// handleDeleteInputDefinition handles DELETE /input-definition request.
+func (h *Handler) handleDeleteInputDefinition(w http.ResponseWriter, r *http.Request) {
+	indexName := mux.Vars(r)["index"]
+	inputDefName := mux.Vars(r)["input-definition"]
+
+	// Find index.
+	index := h.Holder.Index(indexName)
+	if index == nil {
+		http.Error(w, ErrIndexNotFound.Error(), http.StatusNotFound)
+		return
+	}
+
+	// Delete input definition from the index.
+	if err := index.DeleteInputDefinition(inputDefName); err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+
+	err := h.Broadcaster.SendSync(
+		&internal.DeleteInputDefinitionMessage{
+			Index: indexName,
+			Name:  inputDefName,
+		})
+	if err != nil {
+		h.logger().Printf("problem sending DeleteInputDefinition message: %s", err)
+	}
+
+	if err := json.NewEncoder(w).Encode(defaultInputDefinitionResponse{}); err != nil {
+		h.logger().Printf("response encoding error: %s", err)
+	}
+}
+
+type defaultInputDefinitionResponse struct{}
+
+func (h *Handler) handlePostInput(w http.ResponseWriter, r *http.Request) {
+	indexName := mux.Vars(r)["index"]
+	inputDefName := mux.Vars(r)["input-definition"]
+
+	// Find index.
+	index := h.Holder.Index(indexName)
+	if index == nil {
+		http.Error(w, ErrIndexNotFound.Error(), http.StatusNotFound)
+		return
+	}
+
+	// Decode request.
+	var reqs []interface{}
+	err := json.NewDecoder(r.Body).Decode(&reqs)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	for _, req := range reqs {
+		bits, err := h.InputJSONDataParser(req.(map[string]interface{}), index, inputDefName)
+		if err == ErrInputDefinitionNotFound {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		} else if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		for fr, bs := range bits {
+			err := index.InputBits(fr, bs)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+		}
+	}
+	if err := json.NewEncoder(w).Encode(defaultInputDefinitionResponse{}); err != nil {
+		h.logger().Printf("response encoding error: %s", err)
+	}
+}
+
+// InputJSONDataParser validates input json file and executes SetBit.
+func (h *Handler) InputJSONDataParser(req map[string]interface{}, index *Index, name string) (map[string][]*Bit, error) {
+	inputDef, err := index.InputDefinition(name)
+	if err != nil {
+		return nil, err
+	}
+	// If field in input data is not in defined definition, return error.
+	var colValue uint64
+	validFields := make(map[string]bool)
+	timestampFrame := make(map[string]int64)
+	for _, field := range inputDef.Fields() {
+		validFields[field.Name] = true
+		if field.PrimaryKey {
+			value, ok := req[field.Name]
+			if !ok {
+				return nil, fmt.Errorf("primary key does not exist")
+			}
+			rawValue, ok := value.(float64) // The default JSON marshalling will interpret this as a float
+			if !ok {
+				return nil, fmt.Errorf("float64 require, got value:%s, type: %s", value, reflect.TypeOf(value))
+			}
+			colValue = uint64(rawValue)
+		}
+		// Find frame that need to add timestamp.
+		for _, action := range field.Actions {
+			if action.ValueDestination == InputSetTimestamp {
+				timestampFrame[action.Frame], err = GetTimeStamp(req, field.Name)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+
+	for key := range req {
+		_, ok := validFields[key]
+		if !ok {
+			return nil, fmt.Errorf("field not found: %s", key)
+		}
+	}
+
+	setBits := make(map[string][]*Bit)
+
+	for _, field := range inputDef.Fields() {
+		// skip field that defined in definition but not in input data
+		if _, ok := req[field.Name]; !ok {
+			continue
+		}
+
+		// Looking into timestampFrame map and set timestamp to the whole frame
+		for _, action := range field.Actions {
+			frame := action.Frame
+			timestamp := timestampFrame[action.Frame]
+			// Skip input data field values that are set to null
+			if req[field.Name] == nil {
+				continue
+			}
+			bit, err := HandleAction(action, req[field.Name], colValue, timestamp)
+			if err != nil {
+				return nil, fmt.Errorf("error handling action: %s, err: %s", action.ValueDestination, err)
+			}
+			if bit != nil {
+				setBits[frame] = append(setBits[frame], bit)
+			}
+		}
+	}
+	return setBits, nil
+}
+
+func (h *Handler) handleRecalculateCaches(w http.ResponseWriter, r *http.Request) {
+	h.Holder.RecalculateCaches()
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// GetTimeStamp retrieves unix timestamp from Input data.
+func GetTimeStamp(data map[string]interface{}, timeField string) (int64, error) {
+	tmstamp, ok := data[timeField]
+	if !ok {
+		return 0, nil
+	}
+
+	timestamp, ok := tmstamp.(string)
+	if !ok {
+		return 0, fmt.Errorf("set-timestamp value must be in time format: YYYY-MM-DD, has: %v", data[timeField])
+	}
+
+	v, err := time.Parse(TimeFormat, timestamp)
+	if err != nil {
+		return 0, err
+	}
+
+	return v.Unix(), nil
+}
+
+func (h *Handler) handlePostClusterMessage(w http.ResponseWriter, r *http.Request) {
+	// Verify that request is only communicating over protobufs.
+	if r.Header.Get("Content-Type") != "application/x-protobuf" {
+		fmt.Println("**unsupported media type**")
+		http.Error(w, "Unsupported media type", http.StatusUnsupportedMediaType)
+		return
+	}
+
+	// Read entire body.
+	body, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Marshal into request object.
+	pb, err := UnmarshalMessage(body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Forward the error message.
+	err = h.BroadcastHandler.ReceiveMessage(pb)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if err := json.NewEncoder(w).Encode(defaultClusterMessageResponse{}); err != nil {
+		h.logger().Printf("response encoding error: %s", err)
+	}
+}
+
+func (h *Handler) handleGetID(w http.ResponseWriter, r *http.Request) {
+	_, err := w.Write([]byte(h.Holder.LocalID))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+type defaultClusterMessageResponse struct{}

@@ -54,7 +54,7 @@ type Cache interface {
 	SetStats(s StatsClient)
 }
 
-// LRUCache represents a least recently used Cache implemenation.
+// LRUCache represents a least recently used Cache implementation.
 type LRUCache struct {
 	cache  *lru.Cache
 	counts map[uint64]uint64
@@ -215,7 +215,7 @@ func (c *RankCache) IDs() []uint64 {
 	return a
 }
 
-// Invalidate recalculates the the entries by rank.
+// Invalidate recalculates the entries by rank.
 func (c *RankCache) Invalidate() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -256,8 +256,10 @@ func (c *RankCache) recalculate() {
 	length := len(c.rankings)
 	c.stats.Gauge("RankCache", float64(length), 1.0)
 
+	var removeItems []BitmapPair // cached, ordered list
 	if length > int(c.maxEntries) {
 		c.thresholdValue = rankings[c.maxEntries].Count
+		removeItems = c.rankings[c.maxEntries:]
 		c.rankings = c.rankings[0:c.maxEntries]
 	} else {
 		c.thresholdValue = 1
@@ -269,10 +271,8 @@ func (c *RankCache) recalculate() {
 	// If size is larger than the threshold then trim it.
 	if len(c.entries) > c.thresholdBuffer {
 		c.stats.Count("cache.threshold", 1, 1.0)
-		for id, cnt := range c.entries {
-			if cnt <= c.thresholdValue {
-				delete(c.entries, id)
-			}
+		for _, pair := range removeItems {
+			delete(c.entries, pair.ID)
 		}
 	}
 }
@@ -482,4 +482,36 @@ func (s *SimpleCache) Fetch(id uint64) (*Bitmap, bool) {
 // Add adds the bitmap to the cache, keyed on the id.
 func (s *SimpleCache) Add(id uint64, b *Bitmap) {
 	s.cache[id] = b
+}
+
+// NopCache represents a no-op Cache implementation.
+type NopCache struct {
+	stats StatsClient
+}
+
+// Ensure NopCache implements Cache.
+var _ Cache = &NopCache{}
+
+// NewNopCache returns a new instance of NopCache.
+func NewNopCache() *NopCache {
+	return &NopCache{
+		stats: NopStatsClient,
+	}
+}
+
+func (c *NopCache) Add(id uint64, n uint64)     {}
+func (c *NopCache) BulkAdd(id uint64, n uint64) {}
+func (c *NopCache) Get(id uint64) uint64        { return 0 }
+func (c *NopCache) IDs() []uint64               { return make([]uint64, 0, 0) }
+
+func (c *NopCache) Invalidate() {}
+func (c *NopCache) Len() int    { return 0 }
+func (c *NopCache) Recalculate() {
+}
+func (c *NopCache) SetStats(s StatsClient) {
+	c.stats = s
+}
+
+func (c *NopCache) Top() []BitmapPair {
+	return []BitmapPair{}
 }

@@ -37,12 +37,19 @@ const (
 	ALL
 	keyword_end
 
-	EQ     // =
-	COMMA  // ,
-	LPAREN // (
-	RPAREN // )
-	LBRACK // (
-	RBRACK // )
+	ASSIGN  // =
+	EQ      // ==
+	NEQ     // !=
+	LT      // <
+	LTE     // <=
+	GT      // >
+	GTE     // >=
+	BETWEEN // ><
+	COMMA   // ,
+	LPAREN  // (
+	RPAREN  // )
+	LBRACK  // (
+	RBRACK  // )
 )
 
 var tokens = [...]string{
@@ -56,12 +63,19 @@ var tokens = [...]string{
 
 	ALL: "ALL",
 
-	EQ:     "=",
-	COMMA:  ",",
-	LPAREN: "(",
-	RPAREN: ")",
-	LBRACK: "(",
-	RBRACK: ")",
+	ASSIGN:  "=",
+	EQ:      "==",
+	NEQ:     "!=",
+	LT:      "<",
+	LTE:     "<=",
+	GT:      ">",
+	GTE:     ">=",
+	BETWEEN: "><",
+	COMMA:   ",",
+	LPAREN:  "(",
+	RPAREN:  ")",
+	LBRACK:  "(",
+	RBRACK:  ")",
 }
 
 var keywords map[string]Token

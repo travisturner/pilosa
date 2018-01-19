@@ -253,7 +253,12 @@ function populate_version() {
     var node = document.getElementById('server-version')
 
     xhr.onload = function() {
-      version = JSON.parse(xhr.responseText)['version']
+      var version = JSON.parse(xhr.responseText)['version']
+      var version_major_minor = /(v\d+\.\d+)/.exec(version)[0]
+      var doc_link = document.getElementById('nav-documentation')
+      doc_link.onclick = function() {
+        window.open('https://www.pilosa.com/docs/' + version_major_minor + '/introduction/')
+      }
       node.innerHTML = version
     }
     xhr.send(null)
@@ -339,12 +344,11 @@ function render_status(status) {
     tbody = document.createElement("tbody")
     table.appendChild(tbody)
     var caption = document.createElement("caption")
-    caption.innerHTML = indexes[n]["Name"] + " (Column Label: " + indexes[n]["Meta"]["ColumnLabel"] + ")"
+    caption.innerHTML = indexes[n]["Name"]
     table.appendChild(caption)
 
     var header = document.createElement('tr')
     markup = `<th>Name</th>
-    <th>Row Label</th>
     <th>Cache Type</th>
     <th>Cache Size</th>`
     header.innerHTML = markup
@@ -355,7 +359,6 @@ function render_status(status) {
       for(var m=0; m<frames.length; m++) {
         var row = document.createElement("tr")
         row.innerHTML = `<td>${frames[m]["Name"]}</td>
-        <td>${frames[m]["Meta"]["RowLabel"]}</td>
         <td>${frames[m]["Meta"]["CacheType"]}</td>
         <td>${frames[m]["Meta"]["CacheSize"]}</td>`
         tbody.appendChild(row)

@@ -65,6 +65,7 @@ type Broadcaster interface {
 
 func init() {
 	NopBroadcaster = &nopBroadcaster{}
+	NopGossiper = &nopGossiper{}
 }
 
 // NopBroadcaster represents a Broadcaster that doesn't do anything.
@@ -73,12 +74,12 @@ var NopBroadcaster Broadcaster
 type nopBroadcaster struct{}
 
 // SendSync A no-op implemenetation of Broadcaster SendSync method.
-func (c *nopBroadcaster) SendSync(pb proto.Message) error {
+func (n *nopBroadcaster) SendSync(pb proto.Message) error {
 	return nil
 }
 
 // SendAsync A no-op implemenetation of Broadcaster SendAsync method.
-func (c *nopBroadcaster) SendAsync(pb proto.Message) error {
+func (n *nopBroadcaster) SendAsync(pb proto.Message) error {
 	return nil
 }
 
@@ -106,13 +107,31 @@ func (n *nopBroadcastReceiver) Start(b BroadcastHandler) error { return nil }
 // NopBroadcastReceiver is a no-op implementation of the BroadcastReceiver.
 var NopBroadcastReceiver = &nopBroadcastReceiver{}
 
+// Gossiper is an interface for sharing messages via gossip.
+type Gossiper interface {
+	SendAsync(pb proto.Message) error
+}
+
+// NopBroadcaster represents a Broadcaster that doesn't do anything.
+var NopGossiper Gossiper
+
+type nopGossiper struct{}
+
+// SendAsync A no-op implemenetation of Gossiper SendAsync method.
+func (n *nopGossiper) SendAsync(pb proto.Message) error {
+	return nil
+}
+
 // Broadcast message types.
 const (
-	MessageTypeCreateSlice = 1
-	MessageTypeCreateIndex = 2
-	MessageTypeDeleteIndex = 3
-	MessageTypeCreateFrame = 4
-	MessageTypeDeleteFrame = 5
+	MessageTypeCreateSlice           = 1
+	MessageTypeCreateIndex           = 2
+	MessageTypeDeleteIndex           = 3
+	MessageTypeCreateFrame           = 4
+	MessageTypeDeleteFrame           = 5
+	MessageTypeCreateInputDefinition = 6
+	MessageTypeDeleteInputDefinition = 7
+	MessageTypeDeleteView            = 8
 )
 
 // MarshalMessage encodes the protobuf message into a byte slice.
@@ -129,6 +148,12 @@ func MarshalMessage(m proto.Message) ([]byte, error) {
 		typ = MessageTypeCreateFrame
 	case *internal.DeleteFrameMessage:
 		typ = MessageTypeDeleteFrame
+	case *internal.CreateInputDefinitionMessage:
+		typ = MessageTypeCreateInputDefinition
+	case *internal.DeleteInputDefinitionMessage:
+		typ = MessageTypeDeleteInputDefinition
+	case *internal.DeleteViewMessage:
+		typ = MessageTypeDeleteView
 	default:
 		return nil, fmt.Errorf("message type not implemented for marshalling: %s", reflect.TypeOf(obj))
 	}
@@ -155,6 +180,12 @@ func UnmarshalMessage(buf []byte) (proto.Message, error) {
 		m = &internal.CreateFrameMessage{}
 	case MessageTypeDeleteFrame:
 		m = &internal.DeleteFrameMessage{}
+	case MessageTypeCreateInputDefinition:
+		m = &internal.CreateInputDefinitionMessage{}
+	case MessageTypeDeleteInputDefinition:
+		m = &internal.DeleteInputDefinitionMessage{}
+	case MessageTypeDeleteView:
+		m = &internal.DeleteViewMessage{}
 	default:
 		return nil, fmt.Errorf("invalid message type: %d", typ)
 	}

@@ -19,20 +19,32 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
+	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
+
+	uuid "github.com/satori/go.uuid"
 )
 
-// DefaultCacheFlushInterval is the default value for Fragment.CacheFlushInterval.
-const DefaultCacheFlushInterval = 1 * time.Minute
+const (
+	// DefaultCacheFlushInterval is the default value for Fragment.CacheFlushInterval.
+	DefaultCacheFlushInterval = 1 * time.Minute
+
+	// FileLimit is the maximum open file limit (ulimit -n) to automatically set.
+	FileLimit = 262144 // (512^2)
+)
 
 // Holder represents a container for indexes.
 type Holder struct {
-	mu sync.Mutex
+	mu sync.RWMutex
 
 	// Indexes by name.
 	indexes map[string]*Index
@@ -52,6 +64,8 @@ type Holder struct {
 	CacheFlushInterval time.Duration
 
 	LogOutput io.Writer
+
+	LocalID string
 }
 
 // NewHolder returns a new instance of Holder.
@@ -71,6 +85,8 @@ func NewHolder() *Holder {
 
 // Open initializes the root data directory for the holder.
 func (h *Holder) Open() error {
+	h.setFileLimit()
+
 	if err := os.MkdirAll(h.Path, 0777); err != nil {
 		return err
 	}
@@ -115,17 +131,22 @@ func (h *Holder) Open() error {
 	h.wg.Add(1)
 	go func() { defer h.wg.Done(); h.monitorCacheFlush() }()
 
+	h.Stats.Open()
 	return nil
 }
 
 // Close closes all open fragments.
 func (h *Holder) Close() error {
+	h.Stats.Close()
+
 	// Notify goroutines of closing and wait for completion.
 	close(h.closing)
 	h.wg.Wait()
 
 	for _, index := range h.indexes {
-		index.Close()
+		if err := index.Close(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -173,8 +194,8 @@ func (h *Holder) IndexPath(name string) string { return filepath.Join(h.Path, na
 
 // Index returns the index by name.
 func (h *Holder) Index(name string) *Index {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	h.mu.RLock()
+	defer h.mu.RUnlock()
 	return h.index(name)
 }
 
@@ -351,15 +372,93 @@ func (h *Holder) flushCaches() {
 	}
 }
 
+// RecalculateCaches recalculates caches on every index in the holder. This is
+// probably not practical to call in real-world workloads, but makes writing
+// integration tests much eaiser, since one doesn't have to wait 10 seconds
+// after setting bits to get expected response.
+func (h *Holder) RecalculateCaches() {
+	for _, index := range h.Indexes() {
+		index.RecalculateCaches()
+	}
+}
+
+// setFileLimit attempts to set the open file limit to the FileLimit constant defined above.
+func (h *Holder) setFileLimit() {
+	oldLimit := &syscall.Rlimit{}
+	newLimit := &syscall.Rlimit{}
+
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, oldLimit); err != nil {
+		h.logger().Printf("ERROR checking open file limit: %s", err)
+		return
+	}
+	// If the soft limit is lower than the FileLimit constant, we will try to change it.
+	if oldLimit.Cur < FileLimit {
+		newLimit.Cur = FileLimit
+		// If the hard limit is not high enough, we will try to change it too.
+		if oldLimit.Max < FileLimit {
+			newLimit.Max = FileLimit
+		} else {
+			newLimit.Max = oldLimit.Max
+		}
+
+		// Try to set the limit
+		if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, newLimit); err != nil {
+			// If we just tried to change the hard limit and failed, we probably don't have permission. Let's try again without setting the hard limit.
+			if newLimit.Max > oldLimit.Max {
+				newLimit.Max = oldLimit.Max
+				// Obviously the hard limit cannot be higher than the soft limit.
+				if newLimit.Cur >= newLimit.Max {
+					newLimit.Cur = newLimit.Max
+				}
+				// Try setting again with lowered Max (hard limit)
+				if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, newLimit); err != nil {
+					h.logger().Printf("ERROR setting open file limit: %s", err)
+				}
+				// If we weren't trying to change the hard limit, let the user know something is wrong.
+			} else {
+				h.logger().Printf("ERROR setting open file limit: %s", err)
+			}
+		}
+
+		// Check the limit after setting it. OS may not obey Setrlimit call.
+		if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, oldLimit); err != nil {
+			h.logger().Printf("ERROR checking open file limit: %s", err)
+		} else {
+			if oldLimit.Cur < FileLimit {
+				h.logger().Printf("WARNING: Tried to set open file limit to %d, but it is %d. You may consider running \"sudo ulimit -n %d\" before starting Pilosa to avoid \"too many open files\" error. See https://www.pilosa.com/docs/administration/#open-file-limits for more information.", FileLimit, oldLimit.Cur, FileLimit)
+			}
+		}
+	}
+}
+
 func (h *Holder) logger() *log.Logger { return log.New(h.LogOutput, "", log.LstdFlags) }
+
+func (h *Holder) loadLocalID() error {
+	idPath := path.Join(h.Path, "ID")
+	localID := ""
+	localIDBytes, err := ioutil.ReadFile(idPath)
+	if err == nil {
+		localID = strings.TrimSpace(string(localIDBytes))
+	} else {
+		u := uuid.NewV4()
+		localID = u.String()
+		err = ioutil.WriteFile(idPath, []byte(localID), 0600)
+		if err != nil {
+			return err
+		}
+	}
+	h.LocalID = localID
+	return nil
+}
 
 // HolderSyncer is an active anti-entropy tool that compares the local holder
 // with a remote holder based on block checksums and resolves differences.
 type HolderSyncer struct {
 	Holder *Holder
 
-	Host    string
-	Cluster *Cluster
+	URI          *URI
+	Cluster      *Cluster
+	RemoteClient *http.Client
 
 	// Signals that the sync should stop.
 	Closing <-chan struct{}
@@ -408,7 +507,7 @@ func (s *HolderSyncer) SyncHolder() error {
 
 				for slice := uint64(0); slice <= s.Holder.Index(di.Name).MaxSlice(); slice++ {
 					// Ignore slices that this host doesn't own.
-					if !s.Cluster.OwnsFragment(s.Host, di.Name, slice) {
+					if !s.Cluster.OwnsFragment(s.URI.HostPort(), di.Name, slice) {
 						continue
 					}
 
@@ -444,8 +543,8 @@ func (s *HolderSyncer) syncIndex(index string) error {
 	}
 
 	// Sync with every other host.
-	for _, node := range Nodes(s.Cluster.Nodes).FilterHost(s.Host) {
-		client, err := NewClient(node.Host)
+	for _, node := range Nodes(s.Cluster.Nodes).FilterHost(s.URI.HostPort()) {
+		client, err := NewInternalHTTPClient(node.Host, s.RemoteClient)
 		if err != nil {
 			return err
 		}
@@ -489,8 +588,8 @@ func (s *HolderSyncer) syncFrame(index, name string) error {
 	}
 
 	// Sync with every other host.
-	for _, node := range Nodes(s.Cluster.Nodes).FilterHost(s.Host) {
-		client, err := NewClient(node.Host)
+	for _, node := range Nodes(s.Cluster.Nodes).FilterHost(s.URI.HostPort()) {
+		client, err := NewInternalHTTPClient(node.Host, s.RemoteClient)
 		if err != nil {
 			return err
 		}
@@ -543,10 +642,11 @@ func (s *HolderSyncer) syncFragment(index, frame, view string, slice uint64) err
 
 	// Sync fragments together.
 	fs := FragmentSyncer{
-		Fragment: frag,
-		Host:     s.Host,
-		Cluster:  s.Cluster,
-		Closing:  s.Closing,
+		Fragment:     frag,
+		Host:         s.URI.HostPort(),
+		Cluster:      s.Cluster,
+		Closing:      s.Closing,
+		RemoteClient: s.RemoteClient,
 	}
 	if err := fs.SyncFragment(); err != nil {
 		return err

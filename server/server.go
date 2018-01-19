@@ -23,16 +23,18 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
-	"net"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
+	"crypto/tls"
+
+	"io/ioutil"
+
 	"github.com/pilosa/pilosa"
 	"github.com/pilosa/pilosa/gossip"
-	"github.com/pilosa/pilosa/httpbroadcast"
 	"github.com/pilosa/pilosa/statsd"
 )
 
@@ -43,6 +45,9 @@ func init() {
 const (
 	// DefaultDataDir is the default data directory.
 	DefaultDataDir = "~/.pilosa"
+
+	// DefaultDiagnosticsInterval is the default sync frequency diagnostic metrics.
+	DefaultDiagnosticsInterval = 1 * time.Hour
 )
 
 // Command represents the state of the pilosa server command.
@@ -100,42 +105,52 @@ func (m *Command) Run(args ...string) (err error) {
 	if err = m.Server.Open(); err != nil {
 		return fmt.Errorf("server.Open: %v", err)
 	}
-	fmt.Fprintf(m.Stderr, "Listening as http://%s\n", m.Server.Host)
+
+	m.Server.Logger().Printf("Listening as %s\n", m.Server.URI.Normalize())
 	return nil
 }
 
-// SetupServer use the cluster configuration to setup this server
+// SetupServer uses the cluster configuration to set up this server.
 func (m *Command) SetupServer() error {
-	var err error
+	err := m.Config.Validate()
+	if err != nil {
+		return err
+	}
+
+	uri, err := pilosa.AddressWithDefaults(m.Config.Bind)
+	if err != nil {
+		return err
+	}
+	m.Server.URI = uri
+
 	cluster := pilosa.NewCluster()
 	cluster.ReplicaN = m.Config.Cluster.ReplicaN
 
-	for _, hostport := range m.Config.Cluster.Hosts {
-		cluster.Nodes = append(cluster.Nodes, &pilosa.Node{Host: hostport})
-	}
-	// TODO: if InternalHosts is not provided then pilosa.Node.InternalHost is empty.
-	// This will throw an error when trying to Broadcast messages over HTTP.
-	// One option may be to fall back to using host from hostport + config.InternalPort.
-	for i, internalhostport := range m.Config.Cluster.InternalHosts {
-		cluster.Nodes[i].InternalHost = internalhostport
+	for _, address := range m.Config.Cluster.Hosts {
+		uri, err := pilosa.NewURIFromAddress(address)
+		if err != nil {
+			return err
+		}
+		cluster.Nodes = append(cluster.Nodes, &pilosa.Node{
+			Scheme: uri.Scheme(),
+			Host:   uri.HostPort(),
+		})
 	}
 	m.Server.Cluster = cluster
 
 	// Setup logging output.
-	if m.Config.LogPath == "" {
-		m.Server.LogOutput = m.Stderr
-	} else {
-		logFile, err := os.OpenFile(m.Config.LogPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0600)
-		if err != nil {
-			return err
-		}
-		m.Server.LogOutput = logFile
+	m.Server.LogOutput, err = GetLogWriter(m.Config.LogPath, m.Stderr)
+	if err != nil {
+		return err
 	}
 
 	// Configure holder.
-	fmt.Fprintf(m.Stderr, "Using data from: %s\n", m.Config.DataDir)
+	m.Server.Logger().Printf("Using data from: %s\n", m.Config.DataDir)
 	m.Server.Holder.Path = m.Config.DataDir
-	m.Server.MetricInterval = time.Duration(m.Config.Metric.PollingInterval)
+	m.Server.MetricInterval = time.Duration(m.Config.Metric.PollInterval)
+	if m.Config.Metric.Diagnostics {
+		m.Server.DiagnosticInterval = time.Duration(DefaultDiagnosticsInterval)
+	}
 	m.Server.Holder.Stats, err = NewStatsClient(m.Config.Metric.Service, m.Config.Metric.Host)
 	if err != nil {
 		return err
@@ -146,48 +161,79 @@ func (m *Command) SetupServer() error {
 	// Copy configuration flags.
 	m.Server.MaxWritesPerRequest = m.Config.MaxWritesPerRequest
 
-	m.Server.Host, err = normalizeHost(m.Config.Host)
-	if err != nil {
-		return err
+	// Setup TLS
+	var TLSConfig *tls.Config
+	if uri.Scheme() == "https" {
+		if m.Config.TLS.CertificatePath == "" {
+			return errors.New("certificate path is required for TLS sockets")
+		}
+		if m.Config.TLS.CertificateKeyPath == "" {
+			return errors.New("certificate key path is required for TLS sockets")
+		}
+		cert, err := tls.LoadX509KeyPair(m.Config.TLS.CertificatePath, m.Config.TLS.CertificateKeyPath)
+		if err != nil {
+			return err
+		}
+		m.Server.TLS = &tls.Config{
+			Certificates:       []tls.Certificate{cert},
+			InsecureSkipVerify: m.Config.TLS.SkipVerify,
+		}
+
+		// TODO Review this location
+
+		TLSConfig = m.Server.TLS
+
 	}
+	c := pilosa.GetHTTPClient(TLSConfig)
+	m.Server.RemoteClient = c
+	m.Server.Handler.RemoteClient = c
 
 	// Set internal port (string).
-	internalPortStr := pilosa.DefaultInternalPort
-	if m.Config.Cluster.InternalPort != "" {
-		internalPortStr = m.Config.Cluster.InternalPort
+	gossipPortStr := pilosa.DefaultGossipPort
+	// Config.GossipPort is deprecated, so Config.Gossip.Port has priority
+	if m.Config.Gossip.Port != "" {
+		gossipPortStr = m.Config.Gossip.Port
+	} else if m.Config.GossipPort != "" {
+		gossipPortStr = m.Config.GossipPort
 	}
 
 	switch m.Config.Cluster.Type {
-	case "http":
-		m.Server.Broadcaster = httpbroadcast.NewHTTPBroadcaster(m.Server, internalPortStr)
-		m.Server.BroadcastReceiver = httpbroadcast.NewHTTPBroadcastReceiver(internalPortStr, m.Stderr)
-		m.Server.Cluster.NodeSet = httpbroadcast.NewHTTPNodeSet()
-		err := m.Server.Cluster.NodeSet.(*httpbroadcast.HTTPNodeSet).Join(m.Server.Cluster.Nodes)
+	case pilosa.ClusterGossip:
+		gossipPort, err := strconv.Atoi(gossipPortStr)
 		if err != nil {
 			return err
 		}
-	case "gossip":
-		gossipPort, err := strconv.Atoi(internalPortStr)
-		if err != nil {
-			return err
+		gossipSeed := pilosa.DefaultHost + ":" + pilosa.DefaultGossipPort
+		// Config.GossipSeed is deprecated, so Config.Gossip.Seed has priority
+		if m.Config.Gossip.Seed != "" {
+			gossipSeed = m.Config.Gossip.Seed
+		} else if m.Config.GossipSeed != "" {
+			gossipSeed = m.Config.GossipSeed
 		}
-		gossipSeed := pilosa.DefaultHost
-		if m.Config.Cluster.GossipSeed != "" {
-			gossipSeed = m.Config.Cluster.GossipSeed
+
+		var gossipKey []byte
+		if m.Config.Gossip.Key != "" {
+			gossipKey, err = ioutil.ReadFile(m.Config.Gossip.Key)
+			if err != nil {
+				return err
+			}
 		}
+
 		// get the host portion of addr to use for binding
-		gossipHost, _, err := net.SplitHostPort(m.Config.Host)
+		gossipHost := uri.Host()
+		gossipNodeSet, err := gossip.NewGossipNodeSet(uri.HostPort(), gossipHost, gossipPort, gossipSeed, m.Server, gossipKey)
 		if err != nil {
-			gossipHost = m.Config.Host
+			return err
 		}
-		gossipNodeSet := gossip.NewGossipNodeSet(m.Config.Host, gossipHost, gossipPort, gossipSeed, m.Server)
 		m.Server.Cluster.NodeSet = gossipNodeSet
-		m.Server.Broadcaster = gossipNodeSet
+		m.Server.Broadcaster = m.Server
 		m.Server.BroadcastReceiver = gossipNodeSet
-	case "static", "":
+		m.Server.Gossiper = gossipNodeSet
+	case pilosa.ClusterStatic, pilosa.ClusterNone:
 		m.Server.Broadcaster = pilosa.NopBroadcaster
 		m.Server.Cluster.NodeSet = pilosa.NewStaticNodeSet()
 		m.Server.BroadcastReceiver = pilosa.NopBroadcastReceiver
+		m.Server.Gossiper = pilosa.NopGossiper
 		err := m.Server.Cluster.NodeSet.(*pilosa.StaticNodeSet).Join(m.Server.Cluster.Nodes)
 		if err != nil {
 			return err
@@ -202,17 +248,18 @@ func (m *Command) SetupServer() error {
 	return nil
 }
 
-func normalizeHost(host string) (string, error) {
-	if !strings.Contains(host, ":") {
-		host = host + ":"
-	} else if strings.Contains(host, "://") {
-		if strings.HasPrefix(host, "http://") {
-			host = host[7:]
-		} else {
-			return "", fmt.Errorf("invalid scheme or host: '%s'. use the format [http://]<host>:<port>", host)
+// GetLogWriter opens a file for logging, or a default io.Writer (such as stderr) for an empty path.
+func GetLogWriter(path string, defaultWriter io.Writer) (io.Writer, error) {
+	// This is split out so it can be used in NewServeCmd as well as SetupServer
+	if path == "" {
+		return defaultWriter, nil
+	} else {
+		logFile, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0600)
+		if err != nil {
+			return nil, err
 		}
+		return logFile, nil
 	}
-	return host, nil
 }
 
 // Close shuts down the server.

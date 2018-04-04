@@ -18,9 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"io/ioutil"
-	"log"
 	"net/http"
 	"os"
 	"path"
@@ -31,6 +29,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/pilosa/pilosa/internal"
 	uuid "github.com/satori/go.uuid"
 )
 
@@ -48,8 +47,15 @@ type Holder struct {
 
 	// Indexes by name.
 	indexes map[string]*Index
+	hasData bool
+
+	// opened channel is closed once Open() completes.
+	opened chan struct{}
 
 	Broadcaster Broadcaster
+
+	NewAttrStore func(string) AttrStore
+
 	// Close management
 	wg      sync.WaitGroup
 	closing chan struct{}
@@ -63,9 +69,7 @@ type Holder struct {
 	// The interval at which the cached row ids are persisted to disk.
 	CacheFlushInterval time.Duration
 
-	LogOutput io.Writer
-
-	LocalID string
+	Logger Logger
 }
 
 // NewHolder returns a new instance of Holder.
@@ -74,19 +78,54 @@ func NewHolder() *Holder {
 		indexes: make(map[string]*Index),
 		closing: make(chan struct{}, 0),
 
+		opened: make(chan struct{}),
+
 		Broadcaster: NopBroadcaster,
 		Stats:       NopStatsClient,
 
+		NewAttrStore: NewNopAttrStore,
+
 		CacheFlushInterval: DefaultCacheFlushInterval,
 
-		LogOutput: os.Stderr,
+		Logger: NopLogger,
 	}
+}
+
+// Peek reads the root data directory for the holder
+// without actually loading any data into memory.
+// HasData is returned, and h.hasData is set.
+func (h *Holder) Peek() bool {
+	h.Logger.Printf("peek at holder path: %s", h.Path)
+	h.hasData = false
+
+	// Open path to read all index directories.
+	f, err := os.Open(h.Path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	fis, err := f.Readdir(0)
+	if err != nil {
+		return false
+	}
+
+	for _, fi := range fis {
+		if !fi.IsDir() {
+			continue
+		}
+		h.hasData = true
+		break
+	}
+
+	return h.hasData
 }
 
 // Open initializes the root data directory for the holder.
 func (h *Holder) Open() error {
 	h.setFileLimit()
 
+	h.Logger.Printf("open holder path: %s", h.Path)
 	if err := os.MkdirAll(h.Path, 0777); err != nil {
 		return err
 	}
@@ -108,30 +147,35 @@ func (h *Holder) Open() error {
 			continue
 		}
 
-		h.logger().Printf("opening index: %s", filepath.Base(fi.Name()))
+		h.Logger.Printf("opening index: %s", filepath.Base(fi.Name()))
 
 		index, err := h.newIndex(h.IndexPath(filepath.Base(fi.Name())), filepath.Base(fi.Name()))
 		if err == ErrName {
-			h.logger().Printf("ERROR opening index: %s, err=%s", fi.Name(), err)
+			h.Logger.Printf("ERROR opening index: %s, err=%s", fi.Name(), err)
 			continue
 		} else if err != nil {
 			return err
 		}
 		if err := index.Open(); err != nil {
 			if err == ErrName {
-				h.logger().Printf("ERROR opening index: %s, err=%s", index.Name(), err)
+				h.Logger.Printf("ERROR opening index: %s, err=%s", index.Name(), err)
 				continue
 			}
 			return fmt.Errorf("open index: name=%s, err=%s", index.Name(), err)
 		}
+		h.mu.Lock()
 		h.indexes[index.Name()] = index
+		h.mu.Unlock()
 	}
+	h.Logger.Printf("open holder: complete")
 
 	// Periodically flush cache.
 	h.wg.Add(1)
 	go func() { defer h.wg.Done(); h.monitorCacheFlush() }()
 
 	h.Stats.Open()
+
+	close(h.opened)
 	return nil
 }
 
@@ -149,6 +193,15 @@ func (h *Holder) Close() error {
 		}
 	}
 	return nil
+}
+
+// HasData returns true if Holder contains at least one index.
+// This is used to determine if the rebalancing of data is necessary
+// when a node joins the cluster.
+func (h *Holder) HasData() bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.hasData || len(h.indexes) > 0
 }
 
 // MaxSlices returns MaxSlice map for all indexes.
@@ -169,13 +222,13 @@ func (h *Holder) MaxInverseSlices() map[string]uint64 {
 	return a
 }
 
-// Schema returns schema data for all indexes and frames.
+// Schema returns schema information for all indexes, frames, and views.
 func (h *Holder) Schema() []*IndexInfo {
 	var a []*IndexInfo
 	for _, index := range h.Indexes() {
 		di := &IndexInfo{Name: index.Name()}
 		for _, frame := range index.Frames() {
-			fi := &FrameInfo{Name: frame.Name()}
+			fi := &FrameInfo{Name: frame.Name(), Options: frame.Options()}
 			for _, view := range frame.Views() {
 				fi.Views = append(fi.Views, &ViewInfo{Name: view.Name()})
 			}
@@ -187,6 +240,50 @@ func (h *Holder) Schema() []*IndexInfo {
 	}
 	sort.Sort(indexInfoSlice(a))
 	return a
+}
+
+// ApplySchema applies an internal Schema to Holder.
+func (h *Holder) ApplySchema(schema *internal.Schema) error {
+	// Create indexes that don't exist.
+	for _, index := range schema.Indexes {
+		opt := IndexOptions{}
+		idx, err := h.CreateIndexIfNotExists(index.Name, opt)
+		if err != nil {
+			return err
+		}
+		// Create frames that don't exist.
+		for _, f := range index.Frames {
+			opt := decodeFrameOptions(f.Meta)
+			frame, err := idx.CreateFrameIfNotExists(f.Name, *opt)
+			if err != nil {
+				return err
+			}
+			// Create views that don't exist.
+			for _, v := range f.Views {
+				_, err := frame.CreateViewIfNotExists(v)
+				if err != nil {
+					return err
+				}
+			}
+		}
+		// TODO: Create inputDefinitions that don't exist.
+	}
+	return nil
+}
+
+// EncodeMaxSlices creates and internal representation of max slices.
+func (h *Holder) EncodeMaxSlices() *internal.MaxSlices {
+	return &internal.MaxSlices{
+		Standard: h.MaxSlices(),
+		Inverse:  h.MaxInverseSlices(),
+	}
+}
+
+// EncodeSchema creates an internal representation of schema.
+func (h *Holder) EncodeSchema() *internal.Schema {
+	return &internal.Schema{
+		Indexes: EncodeIndexes(h.Indexes()),
+	}
 }
 
 // IndexPath returns the path where a given index is stored.
@@ -262,7 +359,6 @@ func (h *Holder) createIndex(name string, opt IndexOptions) (*Index, error) {
 	}
 
 	// Update options.
-	index.SetColumnLabel(opt.ColumnLabel)
 	index.SetTimeQuantum(opt.TimeQuantum)
 
 	h.indexes[index.Name()] = index
@@ -275,9 +371,11 @@ func (h *Holder) newIndex(path, name string) (*Index, error) {
 	if err != nil {
 		return nil, err
 	}
-	index.LogOutput = h.LogOutput
+	index.Logger = h.Logger
 	index.Stats = h.Stats.WithTags(fmt.Sprintf("index:%s", index.Name()))
 	index.broadcaster = h.Broadcaster
+	index.NewAttrStore = h.NewAttrStore
+	index.columnAttrStore = h.NewAttrStore(filepath.Join(index.path, ".data"))
 	return index, nil
 }
 
@@ -363,7 +461,7 @@ func (h *Holder) flushCaches() {
 					}
 
 					if err := fragment.FlushCache(); err != nil {
-						h.logger().Printf("error flushing cache: err=%s, path=%s", err, fragment.CachePath())
+						h.Logger.Printf("error flushing cache: err=%s, path=%s", err, fragment.CachePath())
 					}
 				}
 			}
@@ -387,7 +485,7 @@ func (h *Holder) setFileLimit() {
 	newLimit := &syscall.Rlimit{}
 
 	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, oldLimit); err != nil {
-		h.logger().Printf("ERROR checking open file limit: %s", err)
+		h.Logger.Printf("ERROR checking open file limit: %s", err)
 		return
 	}
 	// If the soft limit is lower than the FileLimit constant, we will try to change it.
@@ -411,43 +509,48 @@ func (h *Holder) setFileLimit() {
 				}
 				// Try setting again with lowered Max (hard limit)
 				if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, newLimit); err != nil {
-					h.logger().Printf("ERROR setting open file limit: %s", err)
+					h.Logger.Printf("ERROR setting open file limit: %s", err)
 				}
 				// If we weren't trying to change the hard limit, let the user know something is wrong.
 			} else {
-				h.logger().Printf("ERROR setting open file limit: %s", err)
+				h.Logger.Printf("ERROR setting open file limit: %s", err)
 			}
 		}
 
 		// Check the limit after setting it. OS may not obey Setrlimit call.
 		if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, oldLimit); err != nil {
-			h.logger().Printf("ERROR checking open file limit: %s", err)
+			h.Logger.Printf("ERROR checking open file limit: %s", err)
 		} else {
 			if oldLimit.Cur < FileLimit {
-				h.logger().Printf("WARNING: Tried to set open file limit to %d, but it is %d. You may consider running \"sudo ulimit -n %d\" before starting Pilosa to avoid \"too many open files\" error. See https://www.pilosa.com/docs/administration/#open-file-limits for more information.", FileLimit, oldLimit.Cur, FileLimit)
+				h.Logger.Printf("WARNING: Tried to set open file limit to %d, but it is %d. You may consider running \"sudo ulimit -n %d\" before starting Pilosa to avoid \"too many open files\" error. See https://www.pilosa.com/docs/administration/#open-file-limits for more information.", FileLimit, oldLimit.Cur, FileLimit)
 			}
 		}
 	}
 }
 
-func (h *Holder) logger() *log.Logger { return log.New(h.LogOutput, "", log.LstdFlags) }
-
-func (h *Holder) loadLocalID() error {
+func (h *Holder) loadNodeID() (string, error) {
 	idPath := path.Join(h.Path, "ID")
-	localID := ""
-	localIDBytes, err := ioutil.ReadFile(idPath)
-	if err == nil {
-		localID = strings.TrimSpace(string(localIDBytes))
-	} else {
-		u := uuid.NewV4()
-		localID = u.String()
-		err = ioutil.WriteFile(idPath, []byte(localID), 0600)
-		if err != nil {
-			return err
-		}
+	nodeID := ""
+
+	h.Logger.Printf("load NodeID: %s", idPath)
+	if err := os.MkdirAll(h.Path, 0777); err != nil {
+		return "", err
 	}
-	h.LocalID = localID
-	return nil
+
+	nodeIDBytes, err := ioutil.ReadFile(idPath)
+	if err == nil {
+		nodeID = strings.TrimSpace(string(nodeIDBytes))
+	} else if os.IsNotExist(err) {
+		nodeID = uuid.NewV4().String()
+		err = ioutil.WriteFile(idPath, []byte(nodeID), 0600)
+		if err != nil {
+			return "", err
+		}
+	} else if err != nil {
+		return "", err
+	}
+
+	return nodeID, nil
 }
 
 // HolderSyncer is an active anti-entropy tool that compares the local holder
@@ -455,7 +558,7 @@ func (h *Holder) loadLocalID() error {
 type HolderSyncer struct {
 	Holder *Holder
 
-	URI          *URI
+	Node         *Node
 	Cluster      *Cluster
 	RemoteClient *http.Client
 
@@ -511,7 +614,7 @@ func (s *HolderSyncer) SyncHolder() error {
 
 				for slice := uint64(0); slice <= s.Holder.Index(di.Name).MaxSlice(); slice++ {
 					// Ignore slices that this host doesn't own.
-					if !s.Cluster.OwnsFragment(s.URI.HostPort(), di.Name, slice) {
+					if !s.Cluster.OwnsFragment(s.Node.ID, di.Name, slice) {
 						continue
 					}
 
@@ -553,11 +656,8 @@ func (s *HolderSyncer) syncIndex(index string) error {
 	s.Stats.CountWithCustomTags("ColumnAttrStoreBlocks", int64(len(blks)), 1.0, []string{indexTag})
 
 	// Sync with every other host.
-	for _, node := range Nodes(s.Cluster.Nodes).FilterHost(s.URI.HostPort()) {
-		client, err := NewInternalHTTPClient(node.Host, s.RemoteClient)
-		if err != nil {
-			return err
-		}
+	for _, node := range Nodes(s.Cluster.Nodes).FilterID(s.Node.ID) {
+		client := NewInternalHTTPClientFromURI(&node.URI, s.RemoteClient)
 
 		// Retrieve attributes from differing blocks.
 		// Skip update and recomputation if no attributes have changed.
@@ -567,7 +667,7 @@ func (s *HolderSyncer) syncIndex(index string) error {
 		} else if len(m) == 0 {
 			continue
 		}
-		s.Stats.CountWithCustomTags("ColumnAttrDiff", int64(len(m)), 1.0, []string{indexTag, node.Host})
+		s.Stats.CountWithCustomTags("ColumnAttrDiff", int64(len(m)), 1.0, []string{indexTag, node.ID})
 
 		// Update local copy.
 		if err := idx.ColumnAttrStore().SetBulkAttrs(m); err != nil {
@@ -586,7 +686,7 @@ func (s *HolderSyncer) syncIndex(index string) error {
 
 // syncFrame synchronizes frame attributes with the rest of the cluster.
 func (s *HolderSyncer) syncFrame(index, name string) error {
-	// Retrieve index reference.
+	// Retrieve frame reference.
 	f := s.Holder.Frame(index, name)
 	if f == nil {
 		return nil
@@ -602,11 +702,8 @@ func (s *HolderSyncer) syncFrame(index, name string) error {
 	s.Stats.CountWithCustomTags("RowAttrStoreBlocks", int64(len(blks)), 1.0, []string{indexTag, frameTag})
 
 	// Sync with every other host.
-	for _, node := range Nodes(s.Cluster.Nodes).FilterHost(s.URI.HostPort()) {
-		client, err := NewInternalHTTPClient(node.Host, s.RemoteClient)
-		if err != nil {
-			return err
-		}
+	for _, node := range Nodes(s.Cluster.Nodes).FilterID(s.Node.ID) {
+		client := NewInternalHTTPClientFromURI(&node.URI, s.RemoteClient)
 
 		// Retrieve attributes from differing blocks.
 		// Skip update and recomputation if no attributes have changed.
@@ -618,7 +715,7 @@ func (s *HolderSyncer) syncFrame(index, name string) error {
 		} else if len(m) == 0 {
 			continue
 		}
-		s.Stats.CountWithCustomTags("RowAttrDiff", int64(len(m)), 1.0, []string{indexTag, frameTag, node.Host})
+		s.Stats.CountWithCustomTags("RowAttrDiff", int64(len(m)), 1.0, []string{indexTag, frameTag, node.ID})
 
 		// Update local copy.
 		if err := f.RowAttrStore().SetBulkAttrs(m); err != nil {
@@ -658,7 +755,7 @@ func (s *HolderSyncer) syncFragment(index, frame, view string, slice uint64) err
 	// Sync fragments together.
 	fs := FragmentSyncer{
 		Fragment:     frag,
-		Host:         s.URI.HostPort(),
+		Node:         s.Node,
 		Cluster:      s.Cluster,
 		Closing:      s.Closing,
 		RemoteClient: s.RemoteClient,
@@ -668,4 +765,66 @@ func (s *HolderSyncer) syncFragment(index, frame, view string, slice uint64) err
 	}
 
 	return nil
+}
+
+// HolderCleaner removes fragments and data files that are no longer used.
+type HolderCleaner struct {
+	Node *Node
+
+	Holder  *Holder
+	Cluster *Cluster
+
+	// Signals that the sync should stop.
+	Closing <-chan struct{}
+}
+
+// IsClosing returns true if the cleaner has been marked to close.
+func (c *HolderCleaner) IsClosing() bool {
+	select {
+	case <-c.Closing:
+		return true
+	default:
+		return false
+	}
+}
+
+// CleanHolder compares the holder with the cluster state and removes
+// any unnecessary fragments and files.
+func (c *HolderCleaner) CleanHolder() error {
+	for _, index := range c.Holder.Indexes() {
+		// Verify cleaner has not closed.
+		if c.IsClosing() {
+			return nil
+		}
+
+		// Get the fragments that node is responsible for (based on hash(index, node)).
+		containedSlices := c.Cluster.ContainsSlices(index.Name(), index.MaxSlice(), c.Node)
+
+		// Get the fragments registered in memory.
+		for _, frame := range index.Frames() {
+			for _, view := range frame.Views() {
+				for _, fragment := range view.Fragments() {
+					fragSlice := fragment.Slice()
+					// Ignore fragments that should be present.
+					if uint64InSlice(fragSlice, containedSlices) {
+						continue
+					}
+					// Delete fragment.
+					if err := view.DeleteFragment(fragSlice); err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func uint64InSlice(i uint64, s []uint64) bool {
+	for _, o := range s {
+		if i == o {
+			return true
+		}
+	}
+	return false
 }

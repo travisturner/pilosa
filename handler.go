@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:generate statik -src=./webui
-
 package pilosa
 
 import (
@@ -25,11 +23,10 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"net/http"
+	"net/url"
 	// Imported for its side-effect of registering pprof endpoints with the server.
 	_ "net/http/pprof"
-	"os"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -43,10 +40,6 @@ import (
 	"github.com/pilosa/pilosa/pql"
 
 	"unicode"
-
-	// Allow building Pilosa without the web UI.
-	_ "github.com/pilosa/pilosa/statik"
-	"github.com/rakyll/statik/fs"
 )
 
 // Handler represents an HTTP handler.
@@ -56,20 +49,26 @@ type Handler struct {
 	BroadcastHandler BroadcastHandler
 	StatusHandler    StatusHandler
 
+	FileSystem FileSystem
+
 	// Local hostname & cluster configuration.
-	URI          *URI
+	Node         *Node
 	Cluster      *Cluster
 	RemoteClient *http.Client
 
-	Router *mux.Router
+	Router           *mux.Router
+	NormalRouter     *mux.Router
+	RestrictedRouter *mux.Router
 
 	// The execution engine for running queries.
 	Executor interface {
 		Execute(context context.Context, index string, query *pql.Query, slices []uint64, opt *ExecOptions) ([]interface{}, error)
 	}
 
-	// The writer for any logging.
-	LogOutput io.Writer
+	Logger Logger
+
+	// Keeps the query argument validators for each handler
+	validators map[string]*queryValidationSpec
 }
 
 // externalPrefixFlag denotes endpoints that are intended to be exposed to clients.
@@ -85,28 +84,116 @@ var externalPrefixFlag = map[string]bool{
 	"version": true,
 }
 
+type errorResponse struct {
+	Error string `json:"error"`
+}
+
 // NewHandler returns a new instance of Handler with a default logger.
 func NewHandler() *Handler {
 	handler := &Handler{
-		LogOutput: os.Stderr,
+		Broadcaster: NopBroadcaster,
+		//BroadcastHandler: NopBroadcastHandler, // TODO: implement the nop
+		//StatusHandler:    NopStatusHandler,    // TODO: implement the nop
+		FileSystem: NopFileSystem,
+		Logger:     NopLogger,
 	}
-	handler.Router = NewRouter(handler)
+	BuildRouters(handler)
+	handler.populateValidators()
 	return handler
 }
 
-// NewRouter creates a Gorilla Mux http router.
-func NewRouter(handler *Handler) *mux.Router {
+// BuildRouters creates Gorilla Mux http routers for both normal and restricted endpoints.
+func BuildRouters(handler *Handler) {
 	router := mux.NewRouter()
+	loadCommon(router, handler)
+	loadNormal(router, handler)
+	handler.NormalRouter = router
+	router.Use(handler.queryArgValidator)
+
+	// Restricted router.
+	router = mux.NewRouter()
+	loadCommon(router, handler)
+	loadRestricted(router, handler)
+	handler.RestrictedRouter = router
+	router.Use(handler.queryArgValidator)
+
+	handler.SetRestricted()
+}
+
+func (h *Handler) populateValidators() {
+	h.validators = map[string]*queryValidationSpec{}
+	h.validators["GetFragmentNodes"] = QueryValidationSpecRequired("slice").Optional("index")
+	h.validators["GetSliceMax"] = QueryValidationSpecRequired().Optional("inverse")
+	h.validators["PostQuery"] = QueryValidationSpecRequired().Optional("slices", "columnAttrs", "excludeAttrs", "excludeBits")
+	h.validators["GetExport"] = QueryValidationSpecRequired("index", "frame", "view", "slice")
+	h.validators["GetFragmentData"] = QueryValidationSpecRequired("index", "frame", "view", "slice")
+	h.validators["PostFragmentData"] = QueryValidationSpecRequired("index", "frame", "view", "slice")
+	h.validators["GetFragmentBlocks"] = QueryValidationSpecRequired("index", "frame", "view", "slice")
+	h.validators["PostFrameRestore"] = QueryValidationSpecRequired("host")
+}
+
+func (h *Handler) queryArgValidator(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := mux.CurrentRoute(r).GetName()
+		if validator, ok := h.validators[key]; ok {
+			if err := validator.validate(r.URL.Query()); err != nil {
+				// TODO: Return the response depending on the Accept header
+				response := errorResponse{Error: err.Error()}
+				body, err := json.Marshal(response)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				http.Error(w, string(body), http.StatusBadRequest)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// SetNormal is a method of the SecurityManager interface which provides normal URI routing.
+func (h *Handler) SetNormal() {
+	h.Router = h.NormalRouter
+}
+
+// SetRestricted is a method of the SecurityManager interface which provides restricted URI routing.
+func (h *Handler) SetRestricted() {
+	h.Router = h.RestrictedRouter
+}
+
+func loadCommon(router *mux.Router, handler *Handler) {
 	router.HandleFunc("/", handler.handleWebUI).Methods("GET")
 	router.HandleFunc("/assets/{file}", handler.handleWebUI).Methods("GET")
+	router.HandleFunc("/cluster/message", handler.handlePostClusterMessage).Methods("POST")
+	router.HandleFunc("/cluster/resize/set-coordinator", handler.handlePostClusterResizeSetCoordinator).Methods("POST")
 	router.PathPrefix("/debug/pprof/").Handler(http.DefaultServeMux).Methods("GET")
 	router.HandleFunc("/debug/vars", handler.handleExpvar).Methods("GET")
-	router.HandleFunc("/export", handler.handleGetExport).Methods("GET")
+	router.HandleFunc("/fragment/data", handler.handleGetFragmentData).Methods("GET").Name("GetFragmentData")
+	router.HandleFunc("/hosts", handler.handleGetHosts).Methods("GET")
+	router.HandleFunc("/id", handler.handleGetID).Methods("GET")
+	router.HandleFunc("/schema", handler.handleGetSchema).Methods("GET")
+	router.HandleFunc("/slices/max", handler.handleGetSlicesMax).Methods("GET") // TODO: deprecate, but it's being used by the client (for backups)
+	router.HandleFunc("/status", handler.handleGetStatus).Methods("GET")
+	router.HandleFunc("/version", handler.handleGetVersion).Methods("GET")
+	router.Use(handler.queryArgValidator)
+}
+
+func loadRestricted(router *mux.Router, handler *Handler) {
+	router.HandleFunc("/cluster/resize/abort", handler.handlePostClusterResizeAbort).Methods("POST")
+	router.NotFoundHandler = http.HandlerFunc(handler.reportRestricted)
+	router.Use(handler.queryArgValidator)
+}
+
+func loadNormal(router *mux.Router, handler *Handler) {
+	router.HandleFunc("/cluster/resize/remove-node", handler.handlePostClusterResizeRemoveNode).Methods("POST")
+	router.PathPrefix("/debug/pprof/").Handler(http.DefaultServeMux).Methods("GET")
+	router.HandleFunc("/debug/vars", handler.handleExpvar).Methods("GET")
+	router.HandleFunc("/export", handler.handleGetExport).Methods("GET").Name("GetExport")
 	router.HandleFunc("/fragment/block/data", handler.handleGetFragmentBlockData).Methods("GET")
-	router.HandleFunc("/fragment/blocks", handler.handleGetFragmentBlocks).Methods("GET")
-	router.HandleFunc("/fragment/data", handler.handleGetFragmentData).Methods("GET")
-	router.HandleFunc("/fragment/data", handler.handlePostFragmentData).Methods("POST")
-	router.HandleFunc("/fragment/nodes", handler.handleGetFragmentNodes).Methods("GET")
+	router.HandleFunc("/fragment/blocks", handler.handleGetFragmentBlocks).Methods("GET").Name("GetFragmentBlocks")
+	router.HandleFunc("/fragment/data", handler.handlePostFragmentData).Methods("POST").Name("PostFragmentData")
+	router.HandleFunc("/fragment/nodes", handler.handleGetFragmentNodes).Methods("GET").Name("GetFragmentNodes")
 	router.HandleFunc("/import", handler.handlePostImport).Methods("POST")
 	router.HandleFunc("/import-value", handler.handlePostImportValue).Methods("POST")
 	router.HandleFunc("/index", handler.handleGetIndexes).Methods("GET")
@@ -118,7 +205,7 @@ func NewRouter(handler *Handler) *mux.Router {
 	router.HandleFunc("/index/{index}/frame/{frame}", handler.handlePostFrame).Methods("POST")
 	router.HandleFunc("/index/{index}/frame/{frame}", handler.handleDeleteFrame).Methods("DELETE")
 	router.HandleFunc("/index/{index}/frame/{frame}/attr/diff", handler.handlePostFrameAttrDiff).Methods("POST")
-	router.HandleFunc("/index/{index}/frame/{frame}/restore", handler.handlePostFrameRestore).Methods("POST")
+	router.HandleFunc("/index/{index}/frame/{frame}/restore", handler.handlePostFrameRestore).Methods("POST").Name("PostFrameRestore")
 	router.HandleFunc("/index/{index}/frame/{frame}/time-quantum", handler.handlePatchFrameTimeQuantum).Methods("PATCH")
 	router.HandleFunc("/index/{index}/frame/{frame}/field/{field}", handler.handlePostFrameField).Methods("POST")
 	router.HandleFunc("/index/{index}/frame/{frame}/fields", handler.handleGetFrameFields).Methods("GET")
@@ -129,16 +216,9 @@ func NewRouter(handler *Handler) *mux.Router {
 	router.HandleFunc("/index/{index}/input-definition/{input-definition}", handler.handleGetInputDefinition).Methods("GET")
 	router.HandleFunc("/index/{index}/input-definition/{input-definition}", handler.handlePostInputDefinition).Methods("POST")
 	router.HandleFunc("/index/{index}/input-definition/{input-definition}", handler.handleDeleteInputDefinition).Methods("DELETE")
-	router.HandleFunc("/index/{index}/query", handler.handlePostQuery).Methods("POST")
+	router.HandleFunc("/index/{index}/query", handler.handlePostQuery).Methods("POST").Name("PostQuery")
 	router.HandleFunc("/index/{index}/time-quantum", handler.handlePatchIndexTimeQuantum).Methods("PATCH")
-	router.HandleFunc("/hosts", handler.handleGetHosts).Methods("GET")
-	router.HandleFunc("/schema", handler.handleGetSchema).Methods("GET")
-	router.HandleFunc("/slices/max", handler.handleGetSliceMax).Methods("GET")
-	router.HandleFunc("/status", handler.handleGetStatus).Methods("GET")
-	router.HandleFunc("/version", handler.handleGetVersion).Methods("GET")
 	router.HandleFunc("/recalculate-caches", handler.handleRecalculateCaches).Methods("POST")
-	router.HandleFunc("/cluster/message", handler.handlePostClusterMessage).Methods("POST")
-	router.HandleFunc("/id", handler.handleGetID).Methods("GET")
 
 	// TODO: Apply MethodNotAllowed statuses to all endpoints.
 	// Ideally this would be automatic, as described in this (wontfix) ticket:
@@ -146,7 +226,10 @@ func NewRouter(handler *Handler) *mux.Router {
 	// For now we just do it for the most commonly used handler, /query
 	router.HandleFunc("/index/{index}/query", handler.methodNotAllowedHandler).Methods("GET")
 
-	return router
+}
+
+func (h *Handler) reportRestricted(w http.ResponseWriter, r *http.Request) {
+	http.Error(w, fmt.Sprintf("not allowed in cluster state %s", h.Cluster.State()), http.StatusMethodNotAllowed)
 }
 
 func (h *Handler) methodNotAllowedHandler(w http.ResponseWriter, r *http.Request) {
@@ -160,7 +243,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusInternalServerError)
 			stack := debug.Stack()
 			msg := "PANIC: %s\n%s"
-			fmt.Fprintf(h.LogOutput, msg, err, stack)
+			h.Logger.Printf(msg, err, stack)
 			fmt.Fprintf(w, msg, err, stack)
 		}
 	}()
@@ -174,7 +257,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		statsTags := make([]string, 0, 3)
 
 		if h.Cluster.LongQueryTime > 0 && dif > h.Cluster.LongQueryTime {
-			h.logger().Printf("%s %s %v", r.Method, r.URL.String(), dif)
+			h.Logger.Printf("%s %s %v", r.Method, r.URL.String(), dif)
 			statsTags = append(statsTags, "slow_query")
 		}
 
@@ -199,13 +282,13 @@ func (h *Handler) handleWebUI(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Welcome. Pilosa is running. Visit https://www.pilosa.com/docs/ for more information or try the WebUI by visiting this URL in your browser.", http.StatusNotFound)
 		return
 	}
-	statikFS, err := fs.New()
+	filesystem, err := h.FileSystem.New()
 	if err != nil {
 		h.writeQueryResponse(w, r, &QueryResponse{Err: err})
-		h.logger().Println("Pilosa WebUI is not available. Please run `make generate-statik` before building Pilosa with `make install`.")
+		h.Logger.Printf("Pilosa WebUI is not available. Please run `make generate-statik` before building Pilosa with `make install`.")
 		return
 	}
-	http.FileServer(statikFS).ServeHTTP(w, r)
+	http.FileServer(filesystem).ServeHTTP(w, r)
 }
 
 // handleGetSchema handles GET /schema requests.
@@ -213,21 +296,24 @@ func (h *Handler) handleGetSchema(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(getSchemaResponse{
 		Indexes: h.Holder.Schema(),
 	}); err != nil {
-		h.logger().Printf("write schema response error: %s", err)
+		h.Logger.Printf("write schema response error: %s", err)
 	}
 }
 
 // handleGetStatus handles GET /status requests.
 func (h *Handler) handleGetStatus(w http.ResponseWriter, r *http.Request) {
-	status, err := h.StatusHandler.ClusterStatus()
+	pb, err := h.StatusHandler.ClusterStatus()
 	if err != nil {
-		h.logger().Printf("cluster status error: %s", err)
+		h.Logger.Printf("cluster status error: %s", err)
 		return
 	}
+
+	cs := pb.(*internal.ClusterStatus)
 	if err := json.NewEncoder(w).Encode(getStatusResponse{
-		Status: status,
+		State: cs.State,
+		Nodes: DecodeNodes(cs.Nodes),
 	}); err != nil {
-		h.logger().Printf("write status response error: %s", err)
+		h.Logger.Printf("write status response error: %s", err)
 	}
 }
 
@@ -236,7 +322,8 @@ type getSchemaResponse struct {
 }
 
 type getStatusResponse struct {
-	Status proto.Message `json:"status"`
+	State string  `json:"state"`
+	Nodes []*Node `json:"nodes"`
 }
 
 // handlePostQuery handles /query requests.
@@ -304,35 +391,23 @@ func (h *Handler) handlePostQuery(w http.ResponseWriter, r *http.Request) {
 
 	// Write response back to client.
 	if err := h.writeQueryResponse(w, r, resp); err != nil {
-		h.logger().Printf("write query response error: %s", err)
+		h.Logger.Printf("write query response error: %s", err)
 	}
 }
 
-func (h *Handler) handleGetSliceMax(w http.ResponseWriter, r *http.Request) {
-	var ms map[string]uint64
-	if inverse, _ := strconv.ParseBool(r.URL.Query().Get("inverse")); inverse {
-		ms = h.Holder.MaxInverseSlices()
-	} else {
-		ms = h.Holder.MaxSlices()
+// handleGetSlicesMax handles GET /schema requests.
+func (h *Handler) handleGetSlicesMax(w http.ResponseWriter, r *http.Request) {
+	if err := json.NewEncoder(w).Encode(getSlicesMaxResponse{
+		Standard: h.Holder.MaxSlices(),
+		Inverse:  h.Holder.MaxInverseSlices(),
+	}); err != nil {
+		h.Logger.Printf("write slices-max response error: %s", err)
 	}
-	if strings.Contains(r.Header.Get("Accept"), "application/x-protobuf") {
-		pb := &internal.MaxSlicesResponse{
-			MaxSlices: ms,
-		}
-		if buf, err := proto.Marshal(pb); err != nil {
-			h.logger().Printf("protobuf marshal error: %s", err)
-		} else if _, err := w.Write(buf); err != nil {
-			h.logger().Printf("stream write error: %s", err)
-		}
-		return
-	}
-	json.NewEncoder(w).Encode(sliceMaxResponse{
-		MaxSlices: ms,
-	})
 }
 
-type sliceMaxResponse struct {
-	MaxSlices map[string]uint64 `json:"maxSlices"`
+type getSlicesMaxResponse struct {
+	Standard map[string]uint64 `json:"standard"`
+	Inverse  map[string]uint64 `json:"inverse"`
 }
 
 // handleGetIndexes handles GET /index request.
@@ -352,7 +427,7 @@ func (h *Handler) handleGetIndex(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(getIndexResponse{
 		map[string]string{"name": index.Name()},
 	}); err != nil {
-		h.logger().Printf("write response error: %s", err)
+		h.Logger.Printf("write response error: %s", err)
 	}
 }
 
@@ -440,12 +515,12 @@ func (h *Handler) handleDeleteIndex(w http.ResponseWriter, r *http.Request) {
 			Index: indexName,
 		})
 	if err != nil {
-		h.logger().Printf("problem sending DeleteIndex message: %s", err)
+		h.Logger.Printf("problem sending DeleteIndex message: %s", err)
 	}
 
 	// Encode response.
 	if err := json.NewEncoder(w).Encode(deleteIndexResponse{}); err != nil {
-		h.logger().Printf("response encoding error: %s", err)
+		h.Logger.Printf("response encoding error: %s", err)
 	}
 
 	h.Holder.Stats.Count("deleteIndex", 1, 1.0)
@@ -485,14 +560,14 @@ func (h *Handler) handlePostIndex(w http.ResponseWriter, r *http.Request) {
 			Meta:  req.Options.Encode(),
 		})
 	if err != nil {
-		h.logger().Printf("problem sending CreateIndex message: %s", err)
+		h.Logger.Printf("problem sending CreateIndex message: %s", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	// Encode response.
 	if err := json.NewEncoder(w).Encode(postIndexResponse{}); err != nil {
-		h.logger().Printf("response encoding error: %s", err)
+		h.Logger.Printf("response encoding error: %s", err)
 	}
 
 	h.Holder.Stats.Count("createIndex", 1, 1.0)
@@ -531,7 +606,7 @@ func (h *Handler) handlePatchIndexTimeQuantum(w http.ResponseWriter, r *http.Req
 
 	// Encode response.
 	if err := json.NewEncoder(w).Encode(patchIndexTimeQuantumResponse{}); err != nil {
-		h.logger().Printf("response encoding error: %s", err)
+		h.Logger.Printf("response encoding error: %s", err)
 	}
 }
 
@@ -586,7 +661,7 @@ func (h *Handler) handlePostIndexAttrDiff(w http.ResponseWriter, r *http.Request
 	if err := json.NewEncoder(w).Encode(postIndexAttrDiffResponse{
 		Attrs: attrs,
 	}); err != nil {
-		h.logger().Printf("response encoding error: %s", err)
+		h.Logger.Printf("response encoding error: %s", err)
 	}
 }
 
@@ -639,16 +714,15 @@ func (h *Handler) handlePostFrame(w http.ResponseWriter, r *http.Request) {
 			Meta:  req.Options.Encode(),
 		})
 	if err != nil {
-		h.logger().Printf("problem sending CreateFrame message: %s", err)
+		h.Logger.Printf("problem sending CreateFrame message: %s", err)
 	}
 
 	// Encode response.
 	if err := json.NewEncoder(w).Encode(postFrameResponse{}); err != nil {
-		h.logger().Printf("response encoding error: %s", err)
+		h.Logger.Printf("response encoding error: %s", err)
 	}
 
 	h.Holder.Stats.CountWithCustomTags("createFrame", 1, 1.0, []string{fmt.Sprintf("index:%s", indexName)})
-
 }
 
 type _postFrameRequest postFrameRequest
@@ -705,7 +779,7 @@ func (h *Handler) handleDeleteFrame(w http.ResponseWriter, r *http.Request) {
 	index := h.Holder.Index(indexName)
 	if index == nil {
 		if err := json.NewEncoder(w).Encode(deleteIndexResponse{}); err != nil {
-			h.logger().Printf("response encoding error: %s", err)
+			h.Logger.Printf("response encoding error: %s", err)
 		}
 		return
 	}
@@ -723,12 +797,12 @@ func (h *Handler) handleDeleteFrame(w http.ResponseWriter, r *http.Request) {
 			Frame: frameName,
 		})
 	if err != nil {
-		h.logger().Printf("problem sending DeleteFrame message: %s", err)
+		h.Logger.Printf("problem sending DeleteFrame message: %s", err)
 	}
 
 	// Encode response.
 	if err := json.NewEncoder(w).Encode(deleteFrameResponse{}); err != nil {
-		h.logger().Printf("response encoding error: %s", err)
+		h.Logger.Printf("response encoding error: %s", err)
 	}
 
 	h.Holder.Stats.CountWithCustomTags("deleteFrame", 1, 1.0, []string{fmt.Sprintf("index:%s", indexName)})
@@ -770,7 +844,7 @@ func (h *Handler) handlePatchFrameTimeQuantum(w http.ResponseWriter, r *http.Req
 
 	// Encode response.
 	if err := json.NewEncoder(w).Encode(patchFrameTimeQuantumResponse{}); err != nil {
-		h.logger().Printf("response encoding error: %s", err)
+		h.Logger.Printf("response encoding error: %s", err)
 	}
 }
 
@@ -800,20 +874,33 @@ func (h *Handler) handlePostFrameField(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Create new field.
-	if err := f.CreateField(&Field{
+	field := &Field{
 		Name: fieldName,
 		Type: req.Type,
 		Min:  req.Min,
 		Max:  req.Max,
-	}); err != nil {
+	}
+
+	// Create new field.
+	if err := f.CreateField(field); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
+	// Send the create field message to all nodes.
+	err := h.Broadcaster.SendSync(
+		&internal.CreateFieldMessage{
+			Index: indexName,
+			Frame: frameName,
+			Field: encodeField(field),
+		})
+	if err != nil {
+		h.Logger.Printf("problem sending CreateField message: %s", err)
+	}
+
 	// Encode response.
 	if err := json.NewEncoder(w).Encode(postFrameFieldResponse{}); err != nil {
-		h.logger().Printf("response encoding error: %s", err)
+		h.Logger.Printf("response encoding error: %s", err)
 	}
 }
 
@@ -844,9 +931,20 @@ func (h *Handler) handleDeleteFrameField(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Send the delete field message to all nodes.
+	err := h.Broadcaster.SendSync(
+		&internal.DeleteFieldMessage{
+			Index: indexName,
+			Frame: frameName,
+			Field: fieldName,
+		})
+	if err != nil {
+		h.Logger.Printf("problem sending DeleteField message: %s", err)
+	}
+
 	// Encode response.
 	if err := json.NewEncoder(w).Encode(deleteFrameFieldResponse{}); err != nil {
-		h.logger().Printf("response encoding error: %s", err)
+		h.Logger.Printf("response encoding error: %s", err)
 	}
 }
 
@@ -866,7 +964,7 @@ func (h *Handler) handleGetFrameFields(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	schema, err := frame.GetFields()
+	fields, err := frame.GetFields()
 	if err == ErrFrameFieldsNotAllowed {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -876,8 +974,8 @@ func (h *Handler) handleGetFrameFields(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Encode response.
-	if err := json.NewEncoder(w).Encode(getFrameFieldsResponse{Fields: schema.Fields}); err != nil {
-		h.logger().Printf("response encoding error: %s", err)
+	if err := json.NewEncoder(w).Encode(getFrameFieldsResponse{Fields: fields}); err != nil {
+		h.Logger.Printf("response encoding error: %s", err)
 	}
 }
 
@@ -910,7 +1008,7 @@ func (h *Handler) handleGetFrameViews(w http.ResponseWriter, r *http.Request) {
 
 	// Encode response.
 	if err := json.NewEncoder(w).Encode(getFrameViewsResponse{Views: names}); err != nil {
-		h.logger().Printf("response encoding error: %s", err)
+		h.Logger.Printf("response encoding error: %s", err)
 	}
 }
 
@@ -929,7 +1027,7 @@ func (h *Handler) handleDeleteView(w http.ResponseWriter, r *http.Request) {
 
 	// Delete the view.
 	if err := f.DeleteView(viewName); err != nil {
-		// Ingore this error becuase views do not exist on all nodes due to slice distribution.
+		// Ingore this error because views do not exist on all nodes due to slice distribution.
 		if err != ErrInvalidView {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -944,12 +1042,12 @@ func (h *Handler) handleDeleteView(w http.ResponseWriter, r *http.Request) {
 			View:  viewName,
 		})
 	if err != nil {
-		h.logger().Printf("problem sending DeleteView message: %s", err)
+		h.Logger.Printf("problem sending DeleteView message: %s", err)
 	}
 
 	// Encode response.
 	if err := json.NewEncoder(w).Encode(deleteViewResponse{}); err != nil {
-		h.logger().Printf("response encoding error: %s", err)
+		h.Logger.Printf("response encoding error: %s", err)
 	}
 }
 
@@ -1005,7 +1103,7 @@ func (h *Handler) handlePostFrameAttrDiff(w http.ResponseWriter, r *http.Request
 	if err := json.NewEncoder(w).Encode(postFrameAttrDiffResponse{
 		Attrs: attrs,
 	}); err != nil {
-		h.logger().Printf("response encoding error: %s", err)
+		h.Logger.Printf("response encoding error: %s", err)
 	}
 }
 
@@ -1070,12 +1168,6 @@ func (h *Handler) readProtobufQueryRequest(r *http.Request) (*QueryRequest, erro
 // readURLQueryRequest parses query parameters from URL parameters from r.
 func (h *Handler) readURLQueryRequest(r *http.Request) (*QueryRequest, error) {
 	q := r.URL.Query()
-	validQuery := validOptions(QueryRequest{})
-	for key := range q {
-		if _, ok := validQuery[key]; !ok {
-			return nil, errors.New("invalid query params")
-		}
-	}
 
 	// Parse query string.
 	buf, err := ioutil.ReadAll(r.Body)
@@ -1173,17 +1265,17 @@ func (h *Handler) handlePostImport(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validate that this handler owns the slice.
-	if !h.Cluster.OwnsFragment(h.URI.HostPort(), req.Index, req.Slice) {
-		mesg := fmt.Sprintf("host does not own slice %s-%s slice:%d", h.URI, req.Index, req.Slice)
-		http.Error(w, mesg, http.StatusPreconditionFailed)
+	if !h.Cluster.OwnsFragment(h.Node.ID, req.Index, req.Slice) {
+		msg := fmt.Sprintf("host does not own slice %s-%s slice:%d", h.Node.ID, req.Index, req.Slice)
+		http.Error(w, msg, http.StatusPreconditionFailed)
 		return
 	}
 
 	// Find the Index.
-	h.logger().Println("importing:", req.Index, req.Frame, req.Slice)
+	h.Logger.Printf("importing: %s %s %d", req.Index, req.Frame, req.Slice)
 	index := h.Holder.Index(req.Index)
 	if index == nil {
-		h.logger().Printf("fragment error: index=%s, frame=%s, slice=%d, err=%s", req.Index, req.Frame, req.Slice, ErrIndexNotFound.Error())
+		h.Logger.Printf("fragment error: index=%s, frame=%s, slice=%d, err=%s", req.Index, req.Frame, req.Slice, ErrIndexNotFound.Error())
 		http.Error(w, ErrIndexNotFound.Error(), http.StatusNotFound)
 		return
 	}
@@ -1191,7 +1283,7 @@ func (h *Handler) handlePostImport(w http.ResponseWriter, r *http.Request) {
 	// Retrieve frame.
 	f := index.Frame(req.Frame)
 	if f == nil {
-		h.logger().Printf("frame error: index=%s, frame=%s, slice=%d, err=%s", req.Index, req.Frame, req.Slice, ErrFrameNotFound.Error())
+		h.Logger.Printf("frame error: index=%s, frame=%s, slice=%d, err=%s", req.Index, req.Frame, req.Slice, ErrFrameNotFound.Error())
 		http.Error(w, ErrFrameNotFound.Error(), http.StatusNotFound)
 		return
 	}
@@ -1199,7 +1291,7 @@ func (h *Handler) handlePostImport(w http.ResponseWriter, r *http.Request) {
 	// Import into fragment.
 	err = f.Import(req.RowIDs, req.ColumnIDs, timestamps)
 	if err != nil {
-		h.logger().Printf("import error: index=%s, frame=%s, slice=%d, bits=%d, err=%s", req.Index, req.Frame, req.Slice, len(req.ColumnIDs), err)
+		h.Logger.Printf("import error: index=%s, frame=%s, slice=%d, bits=%d, err=%s", req.Index, req.Frame, req.Slice, len(req.ColumnIDs), err)
 		return
 	}
 
@@ -1243,17 +1335,17 @@ func (h *Handler) handlePostImportValue(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Validate that this handler owns the slice.
-	if !h.Cluster.OwnsFragment(h.URI.HostPort(), req.Index, req.Slice) {
-		mesg := fmt.Sprintf("host does not own slice %s-%s slice:%d", h.URI, req.Index, req.Slice)
-		http.Error(w, mesg, http.StatusPreconditionFailed)
+	if !h.Cluster.OwnsFragment(h.Node.ID, req.Index, req.Slice) {
+		msg := fmt.Sprintf("host does not own slice %s-%s slice:%d", h.Node.ID, req.Index, req.Slice)
+		http.Error(w, msg, http.StatusPreconditionFailed)
 		return
 	}
 
 	// Find the Index.
-	h.logger().Println("importing:", req.Index, req.Frame, req.Slice)
+	h.Logger.Printf("importing: %s %s %d", req.Index, req.Frame, req.Slice)
 	index := h.Holder.Index(req.Index)
 	if index == nil {
-		h.logger().Printf("fragment error: index=%s, frame=%s, slice=%d, err=%s", req.Index, req.Frame, req.Slice, ErrIndexNotFound.Error())
+		h.Logger.Printf("fragment error: index=%s, frame=%s, slice=%d, err=%s", req.Index, req.Frame, req.Slice, ErrIndexNotFound.Error())
 		http.Error(w, ErrIndexNotFound.Error(), http.StatusNotFound)
 		return
 	}
@@ -1261,7 +1353,7 @@ func (h *Handler) handlePostImportValue(w http.ResponseWriter, r *http.Request) 
 	// Retrieve frame.
 	f := index.Frame(req.Frame)
 	if f == nil {
-		h.logger().Printf("frame error: index=%s, frame=%s, slice=%d, err=%s", req.Index, req.Frame, req.Slice, ErrFrameNotFound.Error())
+		h.Logger.Printf("frame error: index=%s, frame=%s, slice=%d, err=%s", req.Index, req.Frame, req.Slice, ErrFrameNotFound.Error())
 		http.Error(w, ErrFrameNotFound.Error(), http.StatusNotFound)
 		return
 	}
@@ -1269,7 +1361,7 @@ func (h *Handler) handlePostImportValue(w http.ResponseWriter, r *http.Request) 
 	// Import into fragment.
 	err = f.ImportValue(req.Field, req.ColumnIDs, req.Values)
 	if err != nil {
-		h.logger().Printf("import error: index=%s, frame=%s, slice=%d, field=%s, bits=%d, err=%s", req.Index, req.Frame, req.Slice, req.Field, len(req.ColumnIDs), err)
+		h.Logger.Printf("import error: index=%s, frame=%s, slice=%d, field=%s, bits=%d, err=%s", req.Index, req.Frame, req.Slice, req.Field, len(req.ColumnIDs), err)
 		return
 	}
 
@@ -1309,9 +1401,9 @@ func (h *Handler) handleGetExportCSV(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validate that this handler owns the slice.
-	if !h.Cluster.OwnsFragment(h.URI.HostPort(), index, slice) {
-		mesg := fmt.Sprintf("host does not own slice %s-%s slice:%d", h.URI, index, slice)
-		http.Error(w, mesg, http.StatusPreconditionFailed)
+	if !h.Cluster.OwnsFragment(h.Node.ID, index, slice) {
+		msg := fmt.Sprintf("host does not own slice %s-%s slice:%d", h.Node.ID, index, slice)
+		http.Error(w, msg, http.StatusPreconditionFailed)
 		return
 	}
 
@@ -1347,7 +1439,7 @@ func (h *Handler) handleGetFragmentNodes(w http.ResponseWriter, r *http.Request)
 	// Read slice parameter.
 	slice, err := strconv.ParseUint(q.Get("slice"), 10, 64)
 	if err != nil {
-		http.Error(w, "slice required", http.StatusBadRequest)
+		http.Error(w, "slice should be an unsigned integer", http.StatusBadRequest)
 		return
 	}
 
@@ -1356,11 +1448,11 @@ func (h *Handler) handleGetFragmentNodes(w http.ResponseWriter, r *http.Request)
 
 	// Write to response.
 	if err := json.NewEncoder(w).Encode(nodes); err != nil {
-		h.logger().Printf("json write error: %s", err)
+		h.Logger.Printf("json write error: %s", err)
 	}
 }
 
-// handleGetFragmentBackup handles GET /fragment/data requests.
+// handleGetFragmentData handles GET /fragment/data requests.
 func (h *Handler) handleGetFragmentData(w http.ResponseWriter, r *http.Request) {
 	// Read slice parameter.
 	q := r.URL.Query()
@@ -1379,11 +1471,11 @@ func (h *Handler) handleGetFragmentData(w http.ResponseWriter, r *http.Request) 
 
 	// Stream fragment to response body.
 	if _, err := f.WriteTo(w); err != nil {
-		h.logger().Printf("fragment backup error: %s", err)
+		h.Logger.Printf("fragment backup error: %s", err)
 	}
 }
 
-// handlePostFragmentRestore handles POST /fragment/data requests.
+// handlePostFragmentData handles POST /fragment/data requests.
 func (h *Handler) handlePostFragmentData(w http.ResponseWriter, r *http.Request) {
 	// Read slice parameter.
 	q := r.URL.Query()
@@ -1421,7 +1513,7 @@ func (h *Handler) handlePostFragmentData(w http.ResponseWriter, r *http.Request)
 	}
 }
 
-// handleGetFragmentData handles GET /fragment/block/data requests.
+// handleGetFragmentBlockData handles GET /fragment/block/data requests.
 func (h *Handler) handleGetFragmentBlockData(w http.ResponseWriter, r *http.Request) {
 	// Read request object.
 	var req internal.BlockDataRequest
@@ -1449,7 +1541,7 @@ func (h *Handler) handleGetFragmentBlockData(w http.ResponseWriter, r *http.Requ
 	// Encode response.
 	buf, err := proto.Marshal(&resp)
 	if err != nil {
-		h.logger().Printf("merge block response encoding error: %s", err)
+		h.Logger.Printf("merge block response encoding error: %s", err)
 		return
 	}
 
@@ -1483,7 +1575,7 @@ func (h *Handler) handleGetFragmentBlocks(w http.ResponseWriter, r *http.Request
 	if err := json.NewEncoder(w).Encode(getFragmentBlocksResponse{
 		Blocks: blocks,
 	}); err != nil {
-		h.logger().Printf("block response encoding error: %s", err)
+		h.Logger.Printf("block response encoding error: %s", err)
 	}
 }
 
@@ -1537,7 +1629,7 @@ func (h *Handler) handlePostFrameRestore(w http.ResponseWriter, r *http.Request)
 	// Loop over each slice and import it if this node owns it.
 	for slice := uint64(0); slice <= maxSlices[indexName]; slice++ {
 		// Ignore this slice if we don't own it.
-		if !h.Cluster.OwnsFragment(h.URI.HostPort(), indexName, slice) {
+		if !h.Cluster.OwnsFragment(h.Node.ID, indexName, slice) {
 			continue
 		}
 
@@ -1584,7 +1676,7 @@ func (h *Handler) handlePostFrameRestore(w http.ResponseWriter, r *http.Request)
 // handleGetHosts handles /hosts requests.
 func (h *Handler) handleGetHosts(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(h.Cluster.Nodes); err != nil {
-		h.logger().Printf("write version response error: %s", err)
+		h.Logger.Printf("write version response error: %s", err)
 	}
 }
 
@@ -1600,7 +1692,7 @@ func (h *Handler) handleGetVersion(w http.ResponseWriter, r *http.Request) {
 	}{
 		Version: version,
 	}); err != nil {
-		h.logger().Printf("write version response error: %s", err)
+		h.Logger.Printf("write version response error: %s", err)
 	}
 }
 
@@ -1618,11 +1710,6 @@ func (h *Handler) handleExpvar(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "%q: %s", kv.Key, kv.Value)
 	})
 	fmt.Fprintf(w, "\n}\n")
-}
-
-// logger returns a logger for the handler.
-func (h *Handler) logger() *log.Logger {
-	return log.New(h.LogOutput, "", log.LstdFlags)
 }
 
 // QueryResult types.
@@ -1812,11 +1899,11 @@ func (h *Handler) handlePostInputDefinition(w http.ResponseWriter, r *http.Reque
 			Definition: def,
 		})
 	if err != nil {
-		h.logger().Printf("problem sending CreateInputDefinition message: %s", err)
+		h.Logger.Printf("problem sending CreateInputDefinition message: %s", err)
 	}
 
 	if err := json.NewEncoder(w).Encode(defaultInputDefinitionResponse{}); err != nil {
-		h.logger().Printf("response encoding error: %s", err)
+		h.Logger.Printf("response encoding error: %s", err)
 	}
 }
 
@@ -1842,7 +1929,7 @@ func (h *Handler) handleGetInputDefinition(w http.ResponseWriter, r *http.Reques
 		Frames: inputDef.frames,
 		Fields: inputDef.fields,
 	}); err != nil {
-		h.logger().Printf("write status response error: %s", err)
+		h.Logger.Printf("write status response error: %s", err)
 	}
 
 }
@@ -1871,11 +1958,11 @@ func (h *Handler) handleDeleteInputDefinition(w http.ResponseWriter, r *http.Req
 			Name:  inputDefName,
 		})
 	if err != nil {
-		h.logger().Printf("problem sending DeleteInputDefinition message: %s", err)
+		h.Logger.Printf("problem sending DeleteInputDefinition message: %s", err)
 	}
 
 	if err := json.NewEncoder(w).Encode(defaultInputDefinitionResponse{}); err != nil {
-		h.logger().Printf("response encoding error: %s", err)
+		h.Logger.Printf("response encoding error: %s", err)
 	}
 }
 
@@ -1917,8 +2004,133 @@ func (h *Handler) handlePostInput(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err := json.NewEncoder(w).Encode(defaultInputDefinitionResponse{}); err != nil {
-		h.logger().Printf("response encoding error: %s", err)
+		h.Logger.Printf("response encoding error: %s", err)
 	}
+}
+
+// handlePostClusterResizeSetCoordinator handles POST /cluster/resize/set-coordinator request.
+func (h *Handler) handlePostClusterResizeSetCoordinator(w http.ResponseWriter, r *http.Request) {
+	// Decode request.
+	var req setCoordinatorRequest
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	oldNode := h.Cluster.nodeByID(h.Cluster.Coordinator)
+	newNode := h.Cluster.nodeByID(req.ID)
+	if newNode == nil {
+		http.Error(w, "Node with provided ID does not exist", http.StatusBadRequest)
+		return
+	}
+
+	if err := func() error {
+		// If the new coordinator is this node, do the SetCoordinator directly.
+		if newNode.ID == h.Node.ID {
+			return h.Cluster.SetCoordinator(newNode)
+		}
+
+		// Send the set-coordinator message to new node.
+		err := h.Broadcaster.SendTo(
+			newNode,
+			&internal.SetCoordinatorMessage{
+				New: EncodeNode(newNode),
+			})
+		if err != nil {
+			return fmt.Errorf("problem sending SetCoordinator message: %s", err)
+		}
+
+		return nil
+	}(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Encode response.
+	if err := json.NewEncoder(w).Encode(setCoordinatorResponse{
+		Old: oldNode,
+		New: newNode,
+	}); err != nil {
+		h.Logger.Printf("response encoding error: %s", err)
+	}
+}
+
+type setCoordinatorRequest struct {
+	ID string `json:"id"`
+}
+
+type setCoordinatorResponse struct {
+	Old *Node `json:"old"`
+	New *Node `json:"new"`
+}
+
+// handlePostClusterResizeRemoveNode handles POST /cluster/resize/remove-node request.
+func (h *Handler) handlePostClusterResizeRemoveNode(w http.ResponseWriter, r *http.Request) {
+	// Decode request.
+	var req removeNodeRequest
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	removeNode := h.Cluster.nodeByID(req.ID)
+	if removeNode == nil {
+		http.Error(w, fmt.Sprintf("Node is not a member of the cluster: %s", req.ID), http.StatusBadRequest)
+		return
+	}
+
+	// Start the resize process (similar to NodeJoin)
+	err = h.Cluster.NodeLeave(removeNode)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Encode response.
+	if err := json.NewEncoder(w).Encode(removeNodeResponse{
+		Remove: removeNode,
+	}); err != nil {
+		h.Logger.Printf("response encoding error: %s", err)
+	}
+}
+
+type removeNodeRequest struct {
+	ID string `json:"id"`
+}
+
+type removeNodeResponse struct {
+	Remove *Node `json:"remove"`
+}
+
+// handlePostClusterResizeAbort handles POST /cluster/resize/abort request.
+func (h *Handler) handlePostClusterResizeAbort(w http.ResponseWriter, r *http.Request) {
+	var msg string
+
+	if err := func() error {
+		if !h.Cluster.IsCoordinator() {
+			return fmt.Errorf("abort requests must be made on the coordinator node")
+		}
+		err := h.Cluster.CompleteCurrentJob(ResizeJobStateAborted)
+		if err != nil {
+			return err
+		}
+		return nil
+	}(); err != nil {
+		msg = err.Error()
+	}
+
+	// Encode response.
+	if err := json.NewEncoder(w).Encode(clusterResizeAbortResponse{
+		Info: msg,
+	}); err != nil {
+		h.Logger.Printf("response encoding error: %s", err)
+	}
+}
+
+type clusterResizeAbortResponse struct {
+	Info string `json:"info"`
 }
 
 // InputJSONDataParser validates input json file and executes SetBit.
@@ -1991,6 +2203,12 @@ func (h *Handler) InputJSONDataParser(req map[string]interface{}, index *Index, 
 }
 
 func (h *Handler) handleRecalculateCaches(w http.ResponseWriter, r *http.Request) {
+	err := h.Broadcaster.SendSync(&internal.RecalculateCaches{})
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		h.writeQueryResponse(w, r, &QueryResponse{Err: err})
+		return
+	}
 	h.Holder.RecalculateCaches()
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -2018,7 +2236,6 @@ func GetTimeStamp(data map[string]interface{}, timeField string) (int64, error) 
 func (h *Handler) handlePostClusterMessage(w http.ResponseWriter, r *http.Request) {
 	// Verify that request is only communicating over protobufs.
 	if r.Header.Get("Content-Type") != "application/x-protobuf" {
-		fmt.Println("**unsupported media type**")
 		http.Error(w, "Unsupported media type", http.StatusUnsupportedMediaType)
 		return
 	}
@@ -2045,15 +2262,53 @@ func (h *Handler) handlePostClusterMessage(w http.ResponseWriter, r *http.Reques
 	}
 
 	if err := json.NewEncoder(w).Encode(defaultClusterMessageResponse{}); err != nil {
-		h.logger().Printf("response encoding error: %s", err)
+		h.Logger.Printf("response encoding error: %s", err)
 	}
 }
 
 func (h *Handler) handleGetID(w http.ResponseWriter, r *http.Request) {
-	_, err := w.Write([]byte(h.Holder.LocalID))
+	_, err := w.Write([]byte(h.Cluster.Node.ID))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
 
 type defaultClusterMessageResponse struct{}
+
+type queryValidationSpec struct {
+	required []string
+	args     map[string]struct{}
+}
+
+func QueryValidationSpecRequired(requiredArgs ...string) *queryValidationSpec {
+	args := map[string]struct{}{}
+	for _, arg := range requiredArgs {
+		args[arg] = struct{}{}
+	}
+
+	return &queryValidationSpec{
+		required: requiredArgs,
+		args:     args,
+	}
+}
+
+func (s *queryValidationSpec) Optional(args ...string) *queryValidationSpec {
+	for _, arg := range args {
+		s.args[arg] = struct{}{}
+	}
+	return s
+}
+
+func (s queryValidationSpec) validate(query url.Values) error {
+	for _, req := range s.required {
+		if query.Get(req) == "" {
+			return errors.New(fmt.Sprintf("%s is required", req))
+		}
+	}
+	for k, _ := range query {
+		if _, ok := s.args[k]; !ok {
+			return errors.New(fmt.Sprintf("%s is not a valid argument", k))
+		}
+	}
+	return nil
+}

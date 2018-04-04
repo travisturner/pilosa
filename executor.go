@@ -33,6 +33,9 @@ const (
 	// MinThreshold is the lowest count to use in a Top-N operation when
 	// looking for additional id/count pairs.
 	MinThreshold = 1
+
+	columnLabel = "col"
+	rowLabel    = "row"
 )
 
 // Executor recursively executes calls in a PQL query across all slices.
@@ -40,8 +43,7 @@ type Executor struct {
 	Holder *Holder
 
 	// Local hostname & cluster configuration.
-	Scheme  string
-	Host    string
+	Node    *Node
 	Cluster *Cluster
 
 	// Client used for remote requests.
@@ -81,8 +83,6 @@ func (e *Executor) Execute(ctx context.Context, index string, q *pql.Query, slic
 	// MaxSlice can differ between inverse and standard views, so we need
 	// to send queries to different slices based on orientation.
 	var inverseSlices []uint64
-	rowLabel := DefaultRowLabel
-	columnLabel := DefaultColumnLabel
 
 	// If slices aren't specified, then include all of them.
 	if len(slices) == 0 {
@@ -107,9 +107,6 @@ func (e *Executor) Execute(ctx context.Context, index string, q *pql.Query, slic
 			for i := range inverseSlices {
 				inverseSlices[i] = uint64(i)
 			}
-
-			// Fetch column label from index.
-			columnLabel = idx.ColumnLabel()
 		}
 	}
 
@@ -132,7 +129,6 @@ func (e *Executor) Execute(ctx context.Context, index string, q *pql.Query, slic
 			if f == nil {
 				return nil, ErrFrameNotFound
 			}
-			rowLabel = f.RowLabel()
 
 			// If this call is to an inverse frame send to a different list of slices.
 			if call.IsInverse(rowLabel, columnLabel) {
@@ -269,7 +265,6 @@ func (e *Executor) executeBitmapCall(ctx context.Context, index string, c *pql.C
 		} else {
 			idx := e.Holder.Index(index)
 			if idx != nil {
-				columnLabel := idx.ColumnLabel()
 				if columnID, ok, err := c.UintArg(columnLabel); ok && err == nil {
 					attrs, err := idx.ColumnAttrStore().Attrs(columnID)
 					if err != nil {
@@ -281,7 +276,6 @@ func (e *Executor) executeBitmapCall(ctx context.Context, index string, c *pql.C
 				} else {
 					frame, _ := c.Args["frame"].(string)
 					if fr := idx.Frame(frame); fr != nil {
-						rowLabel := fr.RowLabel()
 						rowID, _, err := c.UintArg(rowLabel)
 						if err != nil {
 							return nil, err
@@ -526,7 +520,6 @@ func (e *Executor) executeBitmapSlice(ctx context.Context, index string, c *pql.
 	if idx == nil {
 		return nil, ErrIndexNotFound
 	}
-	columnLabel := idx.ColumnLabel()
 
 	// Fetch frame & row label based on argument.
 	frame, _ := c.Args["frame"].(string)
@@ -537,7 +530,6 @@ func (e *Executor) executeBitmapSlice(ctx context.Context, index string, c *pql.
 	if f == nil {
 		return nil, ErrFrameNotFound
 	}
-	rowLabel := f.RowLabel()
 
 	// Return an error if both the row and column label are specified.
 	rowID, rowOK, rowErr := c.UintArg(rowLabel)
@@ -607,14 +599,12 @@ func (e *Executor) executeRangeSlice(ctx context.Context, index string, c *pql.C
 	if idx == nil {
 		return nil, ErrIndexNotFound
 	}
-	columnLabel := idx.ColumnLabel()
 
 	// Retrieve base frame.
 	f := idx.Frame(frame)
 	if f == nil {
 		return nil, ErrFrameNotFound
 	}
-	rowLabel := f.RowLabel()
 
 	// Read row & column id.
 	columnID, columnOK, err := c.UintArg(columnLabel)
@@ -801,7 +791,7 @@ func (e *Executor) executeFieldRangeSlice(ctx context.Context, index string, c *
 			return NewBitmap(), nil
 		}
 
-		// LT[E] and GT[E] should return all not-null if selected range fully encompases valid field range.
+		// LT[E] and GT[E] should return all not-null if selected range fully encompasses valid field range.
 		if (cond.Op == pql.LT && value > field.Max) || (cond.Op == pql.LTE && value >= field.Max) ||
 			(cond.Op == pql.GT && value < field.Min) || (cond.Op == pql.GTE && value <= field.Min) {
 			return frag.FieldNotNull(field.BitDepth())
@@ -905,10 +895,6 @@ func (e *Executor) executeClearBit(ctx context.Context, index string, c *pql.Cal
 		return false, ErrFrameNotFound
 	}
 
-	// Retrieve labels.
-	columnLabel := idx.ColumnLabel()
-	rowLabel := f.RowLabel()
-
 	// Read fields using labels.
 	rowID, ok, err := c.UintArg(rowLabel)
 	if err != nil {
@@ -957,7 +943,7 @@ func (e *Executor) executeClearBitView(ctx context.Context, index string, c *pql
 	ret := false
 	for _, node := range e.Cluster.FragmentNodes(index, slice) {
 		// Update locally if host matches.
-		if node.Host == e.Host {
+		if node.ID == e.Node.ID {
 			val, err := f.ClearBit(view, rowID, colID, nil)
 			if err != nil {
 				return false, err
@@ -998,10 +984,6 @@ func (e *Executor) executeSetBit(ctx context.Context, index string, c *pql.Call,
 	if f == nil {
 		return false, ErrFrameNotFound
 	}
-
-	// Retrieve labels.
-	columnLabel := idx.ColumnLabel()
-	rowLabel := f.RowLabel()
 
 	// Read fields using labels.
 	rowID, ok, err := c.UintArg(rowLabel)
@@ -1062,7 +1044,7 @@ func (e *Executor) executeSetBitView(ctx context.Context, index string, c *pql.C
 
 	for _, node := range e.Cluster.FragmentNodes(index, slice) {
 		// Update locally if host matches.
-		if node.Host == e.Host {
+		if node.ID == e.Node.ID {
 			val, err := f.SetBit(view, rowID, colID, timestamp)
 			if err != nil {
 				return false, err
@@ -1093,13 +1075,6 @@ func (e *Executor) executeSetFieldValue(ctx context.Context, index string, c *pq
 	if !ok {
 		return errors.New("SetFieldValue() frame required")
 	}
-
-	// Retrieve column label.
-	idx := e.Holder.Index(index)
-	if idx == nil {
-		return ErrIndexNotFound
-	}
-	columnLabel := idx.ColumnLabel()
 
 	// Retrieve frame.
 	frame := e.Holder.Frame(index, frameName)
@@ -1141,7 +1116,7 @@ func (e *Executor) executeSetFieldValue(ctx context.Context, index string, c *pq
 	}
 
 	// Execute on remote nodes in parallel.
-	nodes := Nodes(e.Cluster.Nodes).FilterHost(e.Host)
+	nodes := Nodes(e.Cluster.Nodes).FilterID(e.Node.ID)
 	resp := make(chan error, len(nodes))
 	for _, node := range nodes {
 		go func(node *Node) {
@@ -1172,7 +1147,6 @@ func (e *Executor) executeSetRowAttrs(ctx context.Context, index string, c *pql.
 	if frame == nil {
 		return ErrFrameNotFound
 	}
-	rowLabel := frame.RowLabel()
 
 	// Parse labels.
 	rowID, ok, err := c.UintArg(rowLabel)
@@ -1199,7 +1173,7 @@ func (e *Executor) executeSetRowAttrs(ctx context.Context, index string, c *pql.
 	}
 
 	// Execute on remote nodes in parallel.
-	nodes := Nodes(e.Cluster.Nodes).FilterHost(e.Host)
+	nodes := Nodes(e.Cluster.Nodes).FilterID(e.Node.ID)
 	resp := make(chan error, len(nodes))
 	for _, node := range nodes {
 		go func(node *Node) {
@@ -1233,7 +1207,6 @@ func (e *Executor) executeBulkSetRowAttrs(ctx context.Context, index string, cal
 		if f == nil {
 			return nil, ErrFrameNotFound
 		}
-		rowLabel := f.RowLabel()
 
 		rowID, ok, err := c.UintArg(rowLabel)
 		if err != nil {
@@ -1286,7 +1259,7 @@ func (e *Executor) executeBulkSetRowAttrs(ctx context.Context, index string, cal
 	}
 
 	// Execute on remote nodes in parallel.
-	nodes := Nodes(e.Cluster.Nodes).FilterHost(e.Host)
+	nodes := Nodes(e.Cluster.Nodes).FilterID(e.Node.ID)
 	resp := make(chan error, len(nodes))
 	for _, node := range nodes {
 		go func(node *Node) {
@@ -1314,28 +1287,18 @@ func (e *Executor) executeSetColumnAttrs(ctx context.Context, index string, c *p
 		return ErrIndexNotFound
 	}
 
-	var colName string
-	id, okID, errID := c.UintArg("id")
-	if errID != nil || !okID {
-		// Retrieve columnLabel
-		columnLabel := idx.columnLabel
-		col, okCol, errCol := c.UintArg(columnLabel)
-		if errCol != nil || !okCol {
-			return fmt.Errorf("reading SetColumnAttrs() id/columnLabel errs: %v/%v found %v/%v", errID, errCol, okID, okCol)
-		}
-		id = col
-		colName = columnLabel
-	} else {
-		colName = "id"
+	col, okCol, errCol := c.UintArg(columnLabel)
+	if errCol != nil || !okCol {
+		return fmt.Errorf("reading SetColumnAttrs() col errs: %v found %v", errCol, okCol)
 	}
 
 	// Copy args and remove reserved fields.
 	attrs := pql.CopyArgs(c.Args)
-	delete(attrs, colName)
+	delete(attrs, columnLabel)
 	delete(attrs, "frame")
 
 	// Set attributes.
-	if err := idx.ColumnAttrStore().SetAttrs(id, attrs); err != nil {
+	if err := idx.ColumnAttrStore().SetAttrs(col, attrs); err != nil {
 		return err
 	}
 	idx.Stats.Count("SetProfileAttrs", 1, 1.0)
@@ -1345,7 +1308,7 @@ func (e *Executor) executeSetColumnAttrs(ctx context.Context, index string, c *p
 	}
 
 	// Execute on remote nodes in parallel.
-	nodes := Nodes(e.Cluster.Nodes).FilterHost(e.Host)
+	nodes := Nodes(e.Cluster.Nodes).FilterID(e.Node.ID)
 	resp := make(chan error, len(nodes))
 	for _, node := range nodes {
 		go func(node *Node) {
@@ -1372,12 +1335,8 @@ func (e *Executor) remoteExec(ctx context.Context, node *Node, index string, q *
 		Slices: slices,
 		Remote: true,
 	}
-	uri, err := NewURIFromAddress(node.Host)
-	if err != nil {
-		return nil, err
-	}
-	uri.SetScheme(node.Scheme)
-	ctx = context.WithValue(ctx, "uri", uri)
+
+	ctx = context.WithValue(ctx, "uri", node.URI)
 	pb, err := e.client.ExecuteQuery(ctx, index, pbreq)
 	if err != nil {
 		return nil, err
@@ -1456,7 +1415,7 @@ func (e *Executor) mapReduce(ctx context.Context, index string, slices []uint64,
 	if !opt.Remote {
 		nodes = Nodes(e.Cluster.Nodes).Clone()
 	} else {
-		nodes = []*Node{e.Cluster.NodeByHost(e.Host)}
+		nodes = []*Node{e.Cluster.nodeByID(e.Node.ID)}
 	}
 
 	// Start mapping across all primary owners.
@@ -1512,7 +1471,7 @@ func (e *Executor) mapper(ctx context.Context, ch chan mapResponse, nodes []*Nod
 			resp := mapResponse{node: n, slices: nodeSlices}
 
 			// Send local slices to mapper, otherwise remote exec.
-			if n.Host == e.Host {
+			if n.ID == e.Node.ID {
 				resp.result, resp.err = e.mapperLocal(ctx, nodeSlices, mapFn, reduceFn)
 			} else if !opt.Remote {
 				results, err := e.remoteExec(ctx, n, index, &pql.Query{Calls: []*pql.Call{c}}, nodeSlices, opt)

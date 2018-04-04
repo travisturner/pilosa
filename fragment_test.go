@@ -163,7 +163,7 @@ func TestFragment_SetFieldValue(t *testing.T) {
 			t.Fatal("expected change")
 		}
 
-		// Non-existant value.
+		// Non-existent value.
 		if value, exists, err := f.FieldValue(100, 11); err != nil {
 			t.Fatal(err)
 		} else if value != 0 {
@@ -702,7 +702,7 @@ func TestFragment_TopN_CacheSize(t *testing.T) {
 		Fragment:     frag,
 		RowAttrStore: test.MustOpenAttrStore(),
 	}
-	f.Fragment.RowAttrStore = f.RowAttrStore.AttrStore
+	f.Fragment.RowAttrStore = f.RowAttrStore
 	if err := f.Open(); err != nil {
 		panic(err)
 	}
@@ -1081,15 +1081,16 @@ func BenchmarkFragment_Snapshot(b *testing.B) {
 		b.Skip("no fragment specified")
 	}
 
-	b.ReportAllocs()
 	// Open the fragment specified by the path.
 	f := pilosa.NewFragment(*FragmentPath, "i", "f", pilosa.ViewStandard, 0)
 	if err := f.Open(); err != nil {
 		b.Fatal(err)
 	}
 	defer f.Close()
-	b.ResetTimer()
+
 	// Reset timer and execute benchmark.
+	b.ResetTimer()
+	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		err := f.Snapshot()
 		if err != nil {

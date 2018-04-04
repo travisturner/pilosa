@@ -106,25 +106,21 @@ func TestIndex_CreateFrame(t *testing.T) {
 				},
 			}); err != nil {
 				t.Fatal(err)
-			} else if !reflect.DeepEqual(f.Schema(), &pilosa.FrameSchema{
-				Fields: []*pilosa.Field{
-					{Name: "field0", Type: pilosa.FieldTypeInt, Min: 10, Max: 20},
-					{Name: "field1", Type: pilosa.FieldTypeInt, Min: 11, Max: 21},
-				},
+			} else if !reflect.DeepEqual(f.Fields(), []*pilosa.Field{
+				{Name: "field0", Type: pilosa.FieldTypeInt, Min: 10, Max: 20},
+				{Name: "field1", Type: pilosa.FieldTypeInt, Min: 11, Max: 21},
 			}) {
-				t.Fatalf("unexpected schema: %#v", f.Schema())
+				t.Fatalf("unexpected fields: %#v", f.Fields())
 			}
 
 			// Reopen the index & verify the fields are loaded.
 			if err := index.Reopen(); err != nil {
 				t.Fatal(err)
-			} else if f := index.Frame("f"); !reflect.DeepEqual(f.Schema(), &pilosa.FrameSchema{
-				Fields: []*pilosa.Field{
-					{Name: "field0", Type: pilosa.FieldTypeInt, Min: 10, Max: 20},
-					{Name: "field1", Type: pilosa.FieldTypeInt, Min: 11, Max: 21},
-				},
+			} else if f := index.Frame("f"); !reflect.DeepEqual(f.Fields(), []*pilosa.Field{
+				{Name: "field0", Type: pilosa.FieldTypeInt, Min: 10, Max: 20},
+				{Name: "field1", Type: pilosa.FieldTypeInt, Min: 11, Max: 21},
 			}) {
-				t.Fatalf("unexpected schema after reopen: %#v", f.Schema())
+				t.Fatalf("unexpected fields after reopen: %#v", f.Fields())
 			}
 		})
 
@@ -140,14 +136,14 @@ func TestIndex_CreateFrame(t *testing.T) {
 			}
 		})
 
-		t.Run("ErrRangeCacheNotAllowed", func(t *testing.T) {
+		t.Run("ErrRangeCacheAllowed", func(t *testing.T) {
 			index := test.MustOpenIndex()
 			defer index.Close()
 
 			if _, err := index.CreateFrame("f", pilosa.FrameOptions{
 				RangeEnabled: true,
 				CacheType:    pilosa.CacheTypeRanked,
-			}); err != pilosa.ErrRangeCacheNotAllowed {
+			}); err != nil {
 				t.Fatal(err)
 			}
 		})
@@ -219,32 +215,6 @@ func TestIndex_CreateFrame(t *testing.T) {
 			}
 		})
 	})
-
-	// Ensure frame cannot be created with a matching row label.
-	t.Run("ErrColumnRowLabelEqual", func(t *testing.T) {
-		t.Run("Explicit", func(t *testing.T) {
-			index := test.MustOpenIndex()
-			defer index.Close()
-
-			_, err := index.CreateFrame("f", pilosa.FrameOptions{RowLabel: pilosa.DefaultColumnLabel})
-			if err != pilosa.ErrColumnRowLabelEqual {
-				t.Fatalf("unexpected error: %s", err)
-			}
-		})
-
-		t.Run("Default", func(t *testing.T) {
-			index := test.MustOpenIndex()
-			defer index.Close()
-			if err := index.SetColumnLabel(pilosa.DefaultRowLabel); err != nil {
-				t.Fatal(err)
-			}
-
-			_, err := index.CreateFrame("f", pilosa.FrameOptions{})
-			if err != pilosa.ErrColumnRowLabelEqual {
-				t.Fatalf("unexpected error: %s", err)
-			}
-		})
-	})
 }
 
 // Ensure index can delete a frame.
@@ -307,7 +277,7 @@ func TestIndex_CreateInputDefinition(t *testing.T) {
 	defer index.Close()
 
 	// Create Input Definition.
-	frames := internal.Frame{Name: "f", Meta: &internal.FrameMeta{RowLabel: "row"}}
+	frames := internal.Frame{Name: "f", Meta: &internal.FrameMeta{}}
 	action := internal.InputDefinitionAction{Frame: "f", ValueDestination: "mapping", ValueMap: map[string]uint64{"Green": 1}}
 	field := internal.InputDefinitionField{Name: "id", PrimaryKey: true, InputDefinitionActions: []*internal.InputDefinitionAction{&action}}
 	def := internal.InputDefinition{Name: "test", Frames: []*internal.Frame{&frames}, Fields: []*internal.InputDefinitionField{&field}}
@@ -334,7 +304,7 @@ func TestIndex_CreateExistingInputDefinition(t *testing.T) {
 	}
 
 	// Create Input Definition.
-	frames := internal.Frame{Name: "f", Meta: &internal.FrameMeta{RowLabel: "row"}}
+	frames := internal.Frame{Name: "f", Meta: &internal.FrameMeta{}}
 	action := internal.InputDefinitionAction{Frame: "f", ValueDestination: "mapping", ValueMap: map[string]uint64{"Green": 1}}
 	fields := internal.InputDefinitionField{Name: "id", PrimaryKey: true, InputDefinitionActions: []*internal.InputDefinitionAction{&action}}
 	def = internal.InputDefinition{Name: "test", Frames: []*internal.Frame{&frames}, Fields: []*internal.InputDefinitionField{&fields}}
@@ -354,7 +324,7 @@ func TestIndex_DeleteInputDefinition(t *testing.T) {
 	defer index.Close()
 
 	// Create Input Definition.
-	frames := internal.Frame{Name: "f", Meta: &internal.FrameMeta{RowLabel: "row"}}
+	frames := internal.Frame{Name: "f", Meta: &internal.FrameMeta{}}
 	action := internal.InputDefinitionAction{Frame: "f", ValueDestination: "mapping", ValueMap: map[string]uint64{"Green": 1}}
 	fields := internal.InputDefinitionField{Name: "id", PrimaryKey: true, InputDefinitionActions: []*internal.InputDefinitionAction{&action}}
 	def := internal.InputDefinition{Name: "test", Frames: []*internal.Frame{&frames}, Fields: []*internal.InputDefinitionField{&fields}}
@@ -385,7 +355,7 @@ func TestIndex_CreateFrameWhenOpenInputDefinition(t *testing.T) {
 	defer index.Close()
 
 	// Create Input Definition.
-	frames := internal.Frame{Name: "f", Meta: &internal.FrameMeta{RowLabel: "row"}}
+	frames := internal.Frame{Name: "f", Meta: &internal.FrameMeta{}}
 	action := internal.InputDefinitionAction{Frame: "f", ValueDestination: "mapping", ValueMap: map[string]uint64{"Green": 1}}
 	fields := internal.InputDefinitionField{Name: "id", PrimaryKey: true, InputDefinitionActions: []*internal.InputDefinitionAction{&action}}
 	def := internal.InputDefinition{Name: "test", Frames: []*internal.Frame{&frames}, Fields: []*internal.InputDefinitionField{&fields}}

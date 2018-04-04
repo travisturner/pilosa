@@ -16,8 +16,6 @@ package pilosa
 
 import (
 	"fmt"
-	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -62,8 +60,8 @@ type View struct {
 	broadcaster Broadcaster
 	stats       StatsClient
 
-	RowAttrStore *AttrStore
-	LogOutput    io.Writer
+	RowAttrStore AttrStore
+	Logger       Logger
 }
 
 // NewView returns a new instance of View.
@@ -80,7 +78,7 @@ func NewView(path, index, frame, name string, cacheSize uint32) *View {
 
 		broadcaster: NopBroadcaster,
 		stats:       NopStatsClient,
-		LogOutput:   ioutil.Discard,
+		Logger:      NopLogger,
 	}
 }
 
@@ -98,6 +96,12 @@ func (v *View) Path() string { return v.path }
 
 // Open opens and initializes the view.
 func (v *View) Open() error {
+
+	// Never keep a cache for field views.
+	if strings.HasPrefix(v.name, ViewFieldPrefix) {
+		v.cacheType = CacheTypeNone
+	}
+
 	if err := func() error {
 		// Ensure the view's path exists.
 		if err := os.MkdirAll(v.path, 0777); err != nil {
@@ -265,9 +269,39 @@ func (v *View) newFragment(path string, slice uint64) *Fragment {
 	frag := NewFragment(path, v.index, v.frame, v.name, slice)
 	frag.CacheType = v.cacheType
 	frag.CacheSize = v.cacheSize
-	frag.LogOutput = v.LogOutput
+	frag.Logger = v.Logger
 	frag.stats = v.stats.WithTags(fmt.Sprintf("slice:%d", slice))
 	return frag
+}
+
+// DeleteFragment removes the fragment from the view.
+func (v *View) DeleteFragment(slice uint64) error {
+
+	fragment := v.fragments[slice]
+	if fragment == nil {
+		return ErrFragmentNotFound
+	}
+
+	v.Logger.Printf("delete fragment: (%s/%s/%s) %d", v.index, v.frame, v.name, slice)
+
+	// Close data files before deletion.
+	if err := fragment.Close(); err != nil {
+		return err
+	}
+
+	// Delete fragment file.
+	if err := os.Remove(fragment.Path()); err != nil {
+		return err
+	}
+
+	// Delete fragment cache file.
+	if err := os.Remove(fragment.CachePath()); err != nil {
+		v.Logger.Printf("no cache file to delete for slice %d", slice)
+	}
+
+	delete(v.fragments, slice)
+
+	return nil
 }
 
 // SetBit sets a bit within the view.

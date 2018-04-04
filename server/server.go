@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -32,10 +33,12 @@ import (
 
 	"crypto/tls"
 
-	"io/ioutil"
-
 	"github.com/pilosa/pilosa"
+	"github.com/pilosa/pilosa/boltdb"
+	"github.com/pilosa/pilosa/gcnotify"
+	"github.com/pilosa/pilosa/gopsutil"
 	"github.com/pilosa/pilosa/gossip"
+	"github.com/pilosa/pilosa/statik"
 	"github.com/pilosa/pilosa/statsd"
 )
 
@@ -59,13 +62,20 @@ type Command struct {
 	CPUProfile string
 	CPUTime    time.Duration
 
+	// Gossip transport
+	GossipTransport *gossip.Transport
+
 	// Standard input/output
 	*pilosa.CmdIO
 
-	// running will be closed once Command.Run is finished.
+	// Started will be closed once Command.Run is finished.
 	Started chan struct{}
 	// Done will be closed when Command.Close() is called
 	Done chan struct{}
+
+	// Passed to the Gossip implementation.
+	logOutput io.Writer
+	logger    *log.Logger
 }
 
 // NewCommand returns a new instance of Main.
@@ -99,12 +109,42 @@ func (m *Command) Run(args ...string) (err error) {
 		return err
 	}
 
+	// SetupNetworking
+	err = m.SetupNetworking()
+	if err != nil {
+		return err
+	}
+
 	// Initialize server.
 	if err = m.Server.Open(); err != nil {
 		return fmt.Errorf("server.Open: %v", err)
 	}
 
-	m.Server.Logger().Printf("Listening as %s\n", m.Server.URI.Normalize())
+	m.Server.Logger.Printf("Listening as %s\n", m.Server.URI)
+	return nil
+}
+
+// SetupLogger sets up the logger based on the configuration.
+func (m *Command) SetupLogger() error {
+	var err error
+	if m.Config.LogPath == "" {
+		m.logOutput = m.Stderr
+	} else {
+		m.logOutput, err = os.OpenFile(m.Config.LogPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0600)
+		if err != nil {
+			return err
+		}
+	}
+
+	if m.Config.Verbose {
+		vbl := pilosa.NewVerboseLogger(m.logOutput)
+		m.logger = vbl.Logger()
+		m.Server.Logger = vbl
+	} else {
+		sl := pilosa.NewStandardLogger(m.logOutput)
+		m.logger = sl.Logger()
+		m.Server.Logger = sl
+	}
 	return nil
 }
 
@@ -115,46 +155,43 @@ func (m *Command) SetupServer() error {
 		return err
 	}
 
+	m.Server.Handler.Logger = m.Server.Logger
+	m.Server.Holder.Logger = m.Server.Logger
+	m.Server.Holder.Stats.SetLogger(m.Server.Logger)
+
 	uri, err := pilosa.AddressWithDefaults(m.Config.Bind)
+
 	if err != nil {
 		return err
 	}
-	m.Server.URI = uri
+	m.Server.URI = *uri
 
 	cluster := pilosa.NewCluster()
 	cluster.ReplicaN = m.Config.Cluster.ReplicaN
+	cluster.Holder = m.Server.Holder
+	cluster.Logger = m.Server.Logger
 
-	for _, address := range m.Config.Cluster.Hosts {
-		uri, err := pilosa.NewURIFromAddress(address)
-		if err != nil {
-			return err
-		}
-		cluster.Nodes = append(cluster.Nodes, &pilosa.Node{
-			Scheme: uri.Scheme(),
-			Host:   uri.HostPort(),
-		})
-	}
 	m.Server.Cluster = cluster
 
-	// Setup logging output.
-	m.Server.LogOutput, err = GetLogWriter(m.Config.LogPath, m.Stderr)
-	if err != nil {
-		return err
-	}
+	// Configure data directory (for Cluster .topology)
+	m.Server.Cluster.Path = m.Config.DataDir
+
+	m.Server.NewAttrStore = boltdb.NewAttrStore
+	m.Server.Holder.NewAttrStore = boltdb.NewAttrStore
 
 	// Configure holder.
-	m.Server.Logger().Printf("Using data from: %s\n", m.Config.DataDir)
+	m.Server.Logger.Printf("Using data from: %s\n", m.Config.DataDir)
 	m.Server.Holder.Path = m.Config.DataDir
 	m.Server.MetricInterval = time.Duration(m.Config.Metric.PollInterval)
 	if m.Config.Metric.Diagnostics {
 		m.Server.DiagnosticInterval = time.Duration(DefaultDiagnosticsInterval)
 	}
+	m.Server.SystemInfo = gopsutil.NewSystemInfo()
+	m.Server.GCNotifier = gcnotify.NewActiveGCNotifier()
 	m.Server.Holder.Stats, err = NewStatsClient(m.Config.Metric.Service, m.Config.Metric.Host)
 	if err != nil {
 		return err
 	}
-
-	m.Server.Holder.Stats.SetLogger(m.Server.LogOutput)
 
 	// Copy configuration flags.
 	m.Server.MaxWritesPerRequest = m.Config.MaxWritesPerRequest
@@ -177,68 +214,15 @@ func (m *Command) SetupServer() error {
 			InsecureSkipVerify: m.Config.TLS.SkipVerify,
 		}
 
-		// TODO Review this location
-
 		TLSConfig = m.Server.TLS
-
 	}
 	c := pilosa.GetHTTPClient(TLSConfig)
 	m.Server.RemoteClient = c
 	m.Server.Handler.RemoteClient = c
+	m.Server.Cluster.RemoteClient = c
 
-	// Set internal port (string).
-	gossipPortStr := pilosa.DefaultGossipPort
-	// Config.GossipPort is deprecated, so Config.Gossip.Port has priority
-	if m.Config.Gossip.Port != "" {
-		gossipPortStr = m.Config.Gossip.Port
-	} else if m.Config.GossipPort != "" {
-		gossipPortStr = m.Config.GossipPort
-	}
-
-	switch m.Config.Cluster.Type {
-	case pilosa.ClusterGossip:
-		gossipPort, err := strconv.Atoi(gossipPortStr)
-		if err != nil {
-			return err
-		}
-		gossipSeed := pilosa.DefaultHost + ":" + pilosa.DefaultGossipPort
-		// Config.GossipSeed is deprecated, so Config.Gossip.Seed has priority
-		if m.Config.Gossip.Seed != "" {
-			gossipSeed = m.Config.Gossip.Seed
-		} else if m.Config.GossipSeed != "" {
-			gossipSeed = m.Config.GossipSeed
-		}
-
-		var gossipKey []byte
-		if m.Config.Gossip.Key != "" {
-			gossipKey, err = ioutil.ReadFile(m.Config.Gossip.Key)
-			if err != nil {
-				return err
-			}
-		}
-
-		// get the host portion of addr to use for binding
-		gossipHost := uri.Host()
-		gossipNodeSet, err := gossip.NewGossipNodeSet(uri.HostPort(), gossipHost, gossipPort, gossipSeed, m.Server, gossipKey)
-		if err != nil {
-			return err
-		}
-		m.Server.Cluster.NodeSet = gossipNodeSet
-		m.Server.Broadcaster = m.Server
-		m.Server.BroadcastReceiver = gossipNodeSet
-		m.Server.Gossiper = gossipNodeSet
-	case pilosa.ClusterStatic, pilosa.ClusterNone:
-		m.Server.Broadcaster = pilosa.NopBroadcaster
-		m.Server.Cluster.NodeSet = pilosa.NewStaticNodeSet()
-		m.Server.BroadcastReceiver = pilosa.NopBroadcastReceiver
-		m.Server.Gossiper = pilosa.NopGossiper
-		err := m.Server.Cluster.NodeSet.(*pilosa.StaticNodeSet).Join(m.Server.Cluster.Nodes)
-		if err != nil {
-			return err
-		}
-	default:
-		return fmt.Errorf("'%v' is not a supported value for broadcaster type", m.Config.Cluster.Type)
-	}
+	// Statik file system.
+	m.Server.Handler.FileSystem = &statik.FileSystem{}
 
 	// Set configuration options.
 	m.Server.AntiEntropyInterval = time.Duration(m.Config.AntiEntropy.Interval)
@@ -246,26 +230,76 @@ func (m *Command) SetupServer() error {
 	return nil
 }
 
-// GetLogWriter opens a file for logging, or a default io.Writer (such as stderr) for an empty path.
-func GetLogWriter(path string, defaultWriter io.Writer) (io.Writer, error) {
-	// This is split out so it can be used in NewServeCmd as well as SetupServer
-	if path == "" {
-		return defaultWriter, nil
-	} else {
-		logFile, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0600)
-		if err != nil {
-			return nil, err
+// SetupNetworking sets up internode communication based on the configuration.
+func (m *Command) SetupNetworking() error {
+
+	m.Server.NodeID = m.Server.LoadNodeID()
+
+	if m.Config.Cluster.Disabled {
+		m.Server.Cluster.Static = true
+		m.Server.Cluster.Coordinator = m.Server.NodeID
+		for _, address := range m.Config.Cluster.Hosts {
+			uri, err := pilosa.NewURIFromAddress(address)
+			if err != nil {
+				return err
+			}
+			m.Server.Cluster.Nodes = append(m.Server.Cluster.Nodes, &pilosa.Node{
+				URI: *uri,
+			})
 		}
-		return logFile, nil
+
+		m.Server.Broadcaster = pilosa.NopBroadcaster
+		m.Server.Cluster.MemberSet = pilosa.NewStaticMemberSet(m.Server.Cluster.Nodes)
+		m.Server.BroadcastReceiver = pilosa.NopBroadcastReceiver
+		m.Server.Gossiper = pilosa.NopGossiper
+		return nil
 	}
+
+	// Set internal port (string).
+	gossipPortStr := pilosa.DefaultGossipPort
+	if m.Config.Gossip.Port != "" {
+		gossipPortStr = m.Config.Gossip.Port
+	}
+
+	gossipPort, err := strconv.Atoi(gossipPortStr)
+	if err != nil {
+		return err
+	}
+
+	// get the host portion of addr to use for binding
+	gossipHost := m.Server.URI.Host()
+	var transport *gossip.Transport
+	if m.GossipTransport != nil {
+		transport = m.GossipTransport
+	} else {
+		transport, err = gossip.NewTransport(gossipHost, gossipPort, m.logger)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Set Coordinator.
+	if m.Config.Cluster.Coordinator || len(m.Config.Gossip.Seeds) == 0 {
+		m.Server.Cluster.Coordinator = m.Server.NodeID
+	}
+
+	m.Server.Cluster.EventReceiver = gossip.NewGossipEventReceiver(m.Server.Logger)
+	gossipMemberSet, err := gossip.NewGossipMemberSet(m.Server.NodeID, m.Config, m.Server, gossip.WithLogger(m.logger), gossip.WithTransport(transport))
+	if err != nil {
+		return err
+	}
+	m.Server.Cluster.MemberSet = gossipMemberSet
+	m.Server.Broadcaster = m.Server
+	m.Server.BroadcastReceiver = gossipMemberSet
+	m.Server.Gossiper = gossipMemberSet
+	return nil
 }
 
 // Close shuts down the server.
 func (m *Command) Close() error {
 	var logErr error
 	serveErr := m.Server.Close()
-	logOutput := m.Server.LogOutput
-	if closer, ok := logOutput.(io.Closer); ok {
+	if closer, ok := m.logOutput.(io.Closer); ok {
 		logErr = closer.Close()
 	}
 	close(m.Done)

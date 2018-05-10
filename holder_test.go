@@ -442,11 +442,10 @@ func TestHolderSyncer_SyncHolder(t *testing.T) {
 
 	// Set up syncer.
 	syncer := pilosa.HolderSyncer{
-		Holder:       hldr0.Holder,
-		Node:         cluster.Nodes[0],
-		Cluster:      cluster,
-		RemoteClient: server.GetHTTPClient(nil),
-		Stats:        pilosa.NopStatsClient,
+		Holder:  hldr0.Holder,
+		Node:    cluster.Nodes[0],
+		Cluster: cluster,
+		Stats:   pilosa.NopStatsClient,
 	}
 
 	if err := syncer.SyncHolder(); err != nil {

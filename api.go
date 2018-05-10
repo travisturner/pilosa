@@ -47,8 +47,9 @@ type API struct {
 	StatusHandler    StatusHandler
 	Cluster          *Cluster
 	URI              URI
-	RemoteClient     *http.Client
 	Logger           Logger
+
+	InternalClient *http.Client // TODO: get rid of this
 }
 
 // NewAPI returns a new API instance.
@@ -441,7 +442,10 @@ func (api *API) RestoreFrame(ctx context.Context, indexName string, frameName st
 	}
 
 	// Create a client for the remote cluster.
-	client := NewInternalHTTPClientFromURI(host, api.RemoteClient)
+	client, err := NewExternalHTTPClient(host.String(), api.InternalClient)
+	if err != nil {
+		return err
+	}
 
 	// Determine the maximum number of slices.
 	maxSlices, err := client.MaxSliceByIndex(ctx)
@@ -685,13 +689,13 @@ func (api *API) CreateField(ctx context.Context, indexName string, frameName str
 	}
 
 	// Retrieve frame by name.
-	f := api.Holder.Frame(indexName, frameName)
-	if f == nil {
+	frame := api.Holder.Frame(indexName, frameName)
+	if frame == nil {
 		return ErrFrameNotFound
 	}
 
 	// Create new field.
-	if err := f.CreateField(field); err != nil {
+	if err := frame.CreateField(field); err != nil {
 		return err
 	}
 
@@ -715,13 +719,13 @@ func (api *API) DeleteField(ctx context.Context, indexName string, frameName str
 	}
 
 	// Retrieve frame by name.
-	f := api.Holder.Frame(indexName, frameName)
-	if f == nil {
+	frame := api.Holder.Frame(indexName, frameName)
+	if frame == nil {
 		return ErrFrameNotFound
 	}
 
 	// Delete field.
-	if err := f.DeleteField(fieldName); err != nil {
+	if err := frame.DeleteField(fieldName); err != nil {
 		return err
 	}
 

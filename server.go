@@ -63,12 +63,12 @@ type Server struct {
 	Broadcaster       Broadcaster
 	BroadcastReceiver BroadcastReceiver
 	Gossiper          Gossiper
-	remoteClient      *http.Client
-	systemInfo        SystemInfo
-	gcNotifier        GCNotifier
-	NewAttrStore      func(string) AttrStore
-	logger            Logger
-	ln                net.Listener
+
+	systemInfo   SystemInfo
+	gcNotifier   GCNotifier
+	NewAttrStore func(string) AttrStore
+	logger       Logger
+	ln           net.Listener
 
 	NodeID              string
 	URI                 URI
@@ -77,8 +77,7 @@ type Server struct {
 	diagnosticInterval  time.Duration
 	maxWritesPerRequest int
 
-	defaultClient InternalClient
-	dataDir       string
+	dataDir string
 }
 
 // ServerOption is a functional option type for pilosa.Server
@@ -162,12 +161,9 @@ func OptServerGCNotifier(gcn GCNotifier) ServerOption {
 	}
 }
 
-func OptServerRemoteClient(c *http.Client) ServerOption {
+func OptServerInternalClient(c *http.Client) ServerOption {
 	return func(s *Server) error {
-		s.executor = NewExecutor(c)
-		s.remoteClient = c
-		s.defaultClient = NewInternalHTTPClientFromURI(nil, c)
-		s.Cluster.RemoteClient = c
+		s.Cluster.internalClient = c
 		return nil
 	}
 }
@@ -211,6 +207,7 @@ func NewServer(opts ...ServerOption) (*Server, error) {
 		Broadcaster:       NopBroadcaster,
 		BroadcastReceiver: NopBroadcastReceiver,
 		diagnostics:       NewDiagnosticsCollector(DefaultDiagnosticServer),
+		executor:          NewExecutor(),
 		systemInfo:        NewNopSystemInfo(),
 
 		gcNotifier: NopGCNotifier,
@@ -251,12 +248,11 @@ func NewServer(opts ...ServerOption) (*Server, error) {
 	}
 
 	s.NodeID = s.LoadNodeID()
-	// Set Cluster Node.
-	node := &Node{
-		ID:            s.NodeID,
-		URI:           s.URI,
-		IsCoordinator: s.Cluster.Coordinator == s.NodeID,
+	node, err := s.newNode()
+	if err != nil {
+		return nil, err
 	}
+
 	s.Cluster.Node = node
 	s.Holder.Stats = s.Holder.Stats.WithTags(fmt.Sprintf("NodeID:%s", s.NodeID))
 
@@ -267,6 +263,21 @@ func NewServer(opts ...ServerOption) (*Server, error) {
 	s.handler.API.Executor = s.executor
 
 	return s, nil
+}
+
+func (s *Server) newNode() (*Node, error) {
+	n, err := NewNode()
+	if err != nil {
+		return nil, err
+	}
+	n.ID = s.NodeID
+	n.URI = s.URI
+	n.IsCoordinator = s.Cluster.Coordinator == s.NodeID
+
+	n.api = &localAPI{
+		api: s.handler.API,
+	}
+	return n, nil
 }
 
 // Open opens and initializes the server.
@@ -412,7 +423,6 @@ func (s *Server) monitorAntiEntropy() {
 		syncer.Node = s.Cluster.Node
 		syncer.Cluster = s.Cluster
 		syncer.Closing = s.closing
-		syncer.RemoteClient = s.remoteClient
 		syncer.Stats = s.Holder.Stats.WithTags("HolderSyncer")
 
 		// Sync holders.
@@ -467,9 +477,9 @@ func (s *Server) ReceiveMessage(pb proto.Message) error {
 			return err
 		}
 	case *internal.CreateFieldMessage:
-		f := s.Holder.Frame(obj.Index, obj.Frame)
+		frame := s.Holder.Frame(obj.Index, obj.Frame)
 		field := decodeField(obj.Field)
-		if err := f.CreateField(field); err != nil {
+		if err := frame.CreateField(field); err != nil {
 			return err
 		}
 	case *internal.DeleteFieldMessage:
@@ -552,7 +562,7 @@ func (s *Server) SendSync(pb proto.Message) error {
 		}
 
 		eg.Go(func() error {
-			return s.defaultClient.SendMessage(context.Background(), &node.URI, pb)
+			return node.api.SendMessage(context.Background(), pb)
 		})
 	}
 
@@ -567,7 +577,7 @@ func (s *Server) SendAsync(pb proto.Message) error {
 // SendTo represents an implementation of Broadcaster.
 func (s *Server) SendTo(to *Node, pb proto.Message) error {
 	s.logger.Printf("SendTo: %s", to.URI)
-	return s.defaultClient.SendMessage(context.Background(), &to.URI, pb)
+	return to.api.SendMessage(context.Background(), pb)
 }
 
 // Server implements StatusHandler.

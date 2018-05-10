@@ -205,7 +205,7 @@ func (m *Command) SetupServer() error {
 	}
 
 	c := GetHTTPClient(TLSConfig)
-	handler.API.RemoteClient = c
+	handler.API.InternalClient = c
 
 	m.Server, err = pilosa.NewServer(
 		pilosa.OptServerAntiEntropyInterval(time.Duration(m.Config.AntiEntropy.Interval)),
@@ -224,7 +224,7 @@ func (m *Command) SetupServer() error {
 		pilosa.OptServerStatsClient(statsClient),
 		pilosa.OptServerListener(ln),
 		pilosa.OptServerURI(uri),
-		pilosa.OptServerRemoteClient(c),
+		pilosa.OptServerInternalClient(c),
 	)
 
 	return errors.Wrap(err, "new server")

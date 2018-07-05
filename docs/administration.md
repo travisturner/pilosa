@@ -24,15 +24,15 @@ Pilosa holds all row/column bitmap data in main memory. While this data is compr
 
 #### CPUs
 
-Pilosa is a concurrent application written in Go and can take full advantage of multicore machines. The main unit of parallelism is the [slice](../data-model/#slice), so a single query will only use a number of cores up to the number of slices stored on that host. Multiple queries can still take advantage of multiple cores as well though, so tuning in this area is dependent on the expected workload.
+Pilosa is a concurrent application written in Go and can take full advantage of multicore machines. The main unit of parallelism is the [shard](../data-model/#shard), so a single query will only use a number of cores up to the number of shards stored on that host. Multiple queries can still take advantage of multiple cores as well, so tuning in this area is dependent upon the expected workload.
 
 #### Disk
 
-Even though the main dataset is in memory Pilosa does back up to disk frequently. We recommend SSDs—especially if you have a write heavy application.
+Even though the main dataset is in memory Pilosa backs up to disk frequently. We recommend SSDs—especially if you have a write-heavy application.
 
 #### Network
 
-Pilosa is designed to be a distributed application, with data replication shared across the cluster. As such every write and read needs to communicate with several nodes. Therefore fast internode communication is essential. If using a service like AWS we recommend that all node exist in the same region and availability zone. The inherent latency of spreading a Pilosa cluster across physical regions it not usually worth the redundancy protection. Since Pilosa is designed to be an indexing service there already should be a system of record, or ability to rebuild a cluster quickly from backups.
+Pilosa is designed to be a distributed application, with data replicated across the cluster. As such, every write and read needs to communicate with several nodes. Therefore fast internode communication is essential. If using a service like AWS we recommend that all nodes exist in the same region and availability zone. The inherent latency of spreading a Pilosa cluster across physical regions is not usually worth the redundancy protection. Since Pilosa is designed to be an indexing service there should already be a system of record, or ability to rebuild a cluster quickly from backups.
 
 #### Overview
 

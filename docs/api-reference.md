@@ -17,7 +17,7 @@ Returns the schema of all indexes in JSON.
 curl -XGET localhost:10101/index
 ```
 ``` response
-{"indexes":[{"name":"user","frames":[{"name":"collab"}]}]}
+{"indexes":[{"name":"user","fields":[{"name":"collab"}]}]}
 ```
 
 ### List index schema
@@ -30,7 +30,7 @@ Returns the schema of the specified index in JSON.
 curl -XGET localhost:10101/index/user
 ```
 ``` response
-{"index":{"name":"user"}, "frames":[{"name":"collab"}]}]}
+{"index":{"name":"user"}, "fields":[{"name":"collab"}]}]}
 ```
 
 ### Create index
@@ -43,7 +43,7 @@ Creates an index with the given name.
 curl -XPOST localhost:10101/index/user
 ```
 ``` response
-{}
+{"success":true}
 ```
 
 ### Remove index
@@ -56,7 +56,7 @@ Removes the given index.
 curl -XDELETE localhost:10101/index/user
 ```
 ``` response
-{}
+{"success":true}
 ```
 
 ### Query index

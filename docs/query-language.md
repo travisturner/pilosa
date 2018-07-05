@@ -29,13 +29,13 @@ There will be one item in the `results` array for each PQL query in the request.
 
 ##### Examples
 
-Before running any of the example queries below, follow the instructions in the [Getting Started](../getting-started/) section to set up an index, frames, and populate them with some data.
+Before running any of the example queries below, follow the instructions in the [Getting Started](../getting-started/) section to set up an index and fields, and to populate them with data.
 
-The examples just show the PQL quer(ies) needed - to run the query `SetBit(frame="stargazer", col=10, row=1)` against a server using curl, you would:
+The examples just show the PQL quer(ies) needed - to run the query `Set(10, stargazer=1)` against a server using curl, you would:
 ``` request
 curl localhost:10101/index/repository/query \
      -X POST \
-     -d 'SetBit(frame="stargazer", col=10, row=1)'
+     -d 'Set(10, stargazer=1)'
 ```
 ``` response
 {"results":[true]}
@@ -43,7 +43,7 @@ curl localhost:10101/index/repository/query \
 
 #### Arguments and Types
 
-* `frame` The frame specifies on which Pilosa [frame](../glossary/#frame) the query will operate. Valid frame names are lower case strings; they start with an alphanumeric character, and contain only alphanumeric characters and `_-`. They must be 64 characters or less in length.
+* `field` The field specifies on which Pilosa [frame](../glossary/#frame) the query will operate. Valid frame names are lower case strings; they start with an alphanumeric character, and contain only alphanumeric characters and `_-`. They must be 64 characters or less in length.
 * `TIMESTAMP` This is a timestamp in quotes with the following format `"YYYY-MM-DDTHH:MM"` (e.g. "2006-01-02T15:04")
 * `UINT` An unsigned integer (e.g. 42839)
 * `ATTR_NAME` Must be a valid identifier `[A-Za-z][A-Za-z0-9._-]*`
@@ -58,13 +58,12 @@ curl localhost:10101/index/repository/query \
 **Spec:**
 
 ```
-SetBit(<frame=STRING>, <row=UINT>, <col=UINT>, 
-       [timestamp=TIMESTAMP])
+Set(<col>, <field>=<UINT>, [timestamp=TIMESTAMP])
 ```
 
 **Description:**
 
-`SetBit` assigns a value of 1 to a bit in the binary matrix, thus associating the given row in the given frame with the given column.
+`Set` assigns a value of 1 to a bit in the binary matrix, thus associating the given row in the given field with the given column.
 
 **Result Type:** boolean
 
@@ -77,17 +76,17 @@ A return value of `false` indicates that the bit was already set to 1 and nothin
 
 Set the bit at row 1, column 10:
 ```request
-SetBit(frame="stargazer", col=10, row=1)
+Set(10, stargazer=1)
 ```
 ```response
 {"results":[true]}
 ```
 
-This sets a bit in the stargazer frame, representing that the user with id=1 has starred the repository with id=10.
+This sets a bit in the stargazer field, representing that the user with id=1 has starred the repository with id=10.
 
-SetBit also supports providing a timestamp. To write the date that a user starred a repository:
+Set also supports providing a timestamp. To write the date that a user starred a repository:
 ```request
-SetBit(frame="stargazer", col=10, row=1, timestamp="2016-01-01T00:00")
+Set(10, stargazer=1, timestamp="2016-01-01T00:00")
 ```
 ```response
 {"results":[true]}
@@ -95,7 +94,7 @@ SetBit(frame="stargazer", col=10, row=1, timestamp="2016-01-01T00:00")
 
 Set multiple bits in a single request:
 ```request
-SetBit(frame="stargazer", col=10, row=1) SetBit(frame="stargazer", col=10, row=2) SetBit(frame="stargazer", col=20, row=1) SetBit(frame="stargazer", col=30, row=2)
+Set(10, stargazer=1) Set(10, stargazer=2) Set(20, stargazer=1) Set(30, stargazer=2)
 ```
 ```response
 {"results":[false,true,true,true]}
@@ -105,14 +104,14 @@ SetBit(frame="stargazer", col=10, row=1) SetBit(frame="stargazer", col=10, row=2
 **Spec:**
 
 ```
-SetRowAttrs(<frame=STRING>, <row=UINT>, 
+SetRowAttrs(<field>, <row>, 
             <ATTR_NAME=ATTR_VALUE>, 
             [ATTR_NAME=ATTR_VALUE ...])
 ```
 
 **Description:**
 
-`SetRowAttrs` associates arbitrary key/value pairs with a row in a frame. Setting a value of `null`, without quotes, deletes an attribute.
+`SetRowAttrs` associates arbitrary key/value pairs with a row in a field. Setting a value of `null`, without quotes, deletes an attribute.
 
 **Result Type:** null
 
@@ -122,17 +121,17 @@ SetRowAttrs queries always return `null` upon success.
 
 Set attributes `username` and `active` on row 10:
 ```request
-SetRowAttrs(frame="stargazer", row=10, username="mrpi", active=true)
+SetRowAttrs(stargazer, 10, username="mrpi", active=true)
 ```
 ```response
 {"results":[null]}
 ```
 
-Set username value and active status for user 10. These are arbitrary key/value pairs which have no meaning to Pilosa. You can see the attributes you've set on a row with a [Bitmap](../query-language/#bitmap) query like so `Bitmap(frame="stargazer", row=10)`.
+Set username value and active status for user 10. These are arbitrary key/value pairs which have no meaning to Pilosa. You can see the attributes you've set on a row with a [Row](../query-language/#row) query like so `Row(stargazer=10)`.
 
 Delete attribute `username` on row 10:
 ```request
-SetRowAttrs(frame="stargazer", row=10, username=null)
+SetRowAttrs(stargazer, 10, username=null)
 ```
 ```response
 {"results":[null]}
@@ -143,7 +142,7 @@ SetRowAttrs(frame="stargazer", row=10, username=null)
 **Spec:**
 
 ```
-SetColumnAttrs(<frame=STRING>, <row=UINT>, 
+SetColumnAttrs(<field>, <row>, 
                <ATTR_NAME=ATTR_VALUE>, 
                [ATTR_NAME=ATTR_VALUE ...])
 ```
@@ -154,13 +153,13 @@ SetColumnAttrs(<frame=STRING>, <row=UINT>,
 
 **Result Type:** null
 
-SetColumnAttrs queries always return `null` upon success. Setting a value of `null`, without quotes, deletes an attribute. To avoid confusion, `frame` cannot be used as an attribute name.
+SetColumnAttrs queries always return `null` upon success. Setting a value of `null`, without quotes, deletes an attribute.
 
 **Examples:**
 
 Set attributes `stars`, `url`, and `active` on column 10:
 ```request
-SetColumnAttrs(col=10, stars=123, url="http://projects.pilosa.com/10", active=true)
+SetColumnAttrs(10, stars=123, url="http://projects.pilosa.com/10", active=true)
 ```
 ```response
 {"results":[null]}
@@ -170,13 +169,13 @@ Set url value and active status for project 10. These are arbitrary key/value pa
 
 ColumnAttrs can be requested by adding the URL parameter `columnAttrs=true` to a query. For example:
 ```request
-curl localhost:10101/index/repository/query?columnAttrs=true -XPOST -d 'Bitmap(frame="stargazer", row=1)Bitmap(frame="stargazer", row=2)'
+curl localhost:10101/index/repository/query?columnAttrs=true -XPOST -d 'Row(stargazer=1) Row(stargazer=2)'
 ```
 ```response
 {
   "results":[
-    {"attrs":{},"bits":[10,20]},
-    {"attrs":{},"bits":[10,30]}
+    {"attrs":{},"cols":[10,20]},
+    {"attrs":{},"cols":[10,30]}
   ],
   "columnAttrs":[
     {"id":10,"attrs":{"active":true,"stars":123,"url":"http://projects.pilosa.com/10"}},
@@ -189,7 +188,7 @@ In this example, ColumnAttrs have been set on columns 10 and 20, but not column 
 
 Delete the `url` attribute on column 10:
 ```request
-SetColumnAttrs(col=10, url=null)
+SetColumnAttrs(10, url=null)
 ```
 ```response
 {"results":[null]}
@@ -200,14 +199,14 @@ SetColumnAttrs(col=10, url=null)
 **Spec:**
 
 ```
-ClearBit(<frame=STRING>, <row=UINT>, <col=UINT>)
+Clear(<col>, <field>=<row>)
 ```
 
 **Description:**
 
-`ClearBit` assigns a value of 0 to a bit in the binary matrix, thus disassociating the given row in the given frame from the given column.
+`Clear` assigns a value of 0 to a bit in the binary matrix, thus disassociating the given row in the given field from the given column.
 
-Note that clearing bits from time views is not supported.
+Note that clearing a columns on a time field will remove all data for that column.
 
 **Result Type:** boolean
 
@@ -217,9 +216,9 @@ A return value of `false` indicates that the bit was already set to 0 and nothin
 
 **Examples:**
 
-Clear the bit at row 1 and column 10 in the stargazer frame:
+Clear the bit at row 1 and column 10 in the stargazer field:
 ```request
-ClearBit(frame="stargazer", col=10, row=1)
+Clear(10, stargazer=1)
 ```
 ```response
 {"results":[true]}
@@ -260,21 +259,21 @@ This example assumes the existence of the frame `stats` and the field `pullreque
 
 ### Read Operations
 
-#### Bitmap
+#### Row
 
 **Spec:**
 
 ```
-Bitmap(<frame=STRING>, (<rowL=UINT> | <col>=UINT))
+Row(<field>=<UINT>)
 ```
 
 **Description:**
 
-`Bitmap` retrieves the indices of all the set bits in a row or column based on whether the row or column argument is provided in the query. It also retrieves any attributes set on that row or column.
+`Row` retrieves the indices of all the columns in a row. It also retrieves any attributes set on that row.
 
 **Result Type:** object with attrs and bits.
 
-e.g. `{"attrs":{"username":"mrpi","active":true},"bits":[10, 20]}`
+e.g. `{"attrs":{"username":"mrpi","active":true},"cols":[10, 20]}`
 
 **Examples:**
 

@@ -6,7 +6,7 @@ nav = [
     "Index",
     "Column",
     "Row",
-    "Frame",
+    "Field",
     "Time Quantum",
     "Attribute",
     "Slice",
@@ -22,7 +22,7 @@ The central component of Pilosa's data model is a boolean matrix. Each cell in t
 
 Rows and columns can represent anything (they could even represent the same set of things - a [bigraph](https://en.wikipedia.org/wiki/Bigraph)). Pilosa can associate arbitrary key/value pairs (referred to as attributes) to rows and columns, but queries and storage are optimized around the core matrix.
 
-Pilosa lays out data first in rows, so queries which get all the set bits in one or many rows, or compute a combining operation on multiple rows such as Intersect or Union are the fastest. Pilosa categorizes rows into different *frames* and quickly retrieves the top rows in a frame sorted by the number of bits set in each row.
+Pilosa lays out data first in rows, so queries which get all the set bits in one or many rows, or compute a combining operation on multiple rows such as Intersect or Union are the fastest. Pilosa categorizes rows into different *fields* and quickly retrieves the top rows in a field sorted by the number of columns set in each row.
 
 Please note that Pilosa is most performant when row and column IDs are sequential starting from 0. You can deviate from this to some degree, but setting a bit with column ID 2<sup>63</sup> on a single-node cluster, for example, will not work well due to memory limitations.
 
@@ -35,15 +35,15 @@ The purpose of the Index is to represent a data namespace. You cannot perform cr
 
 ### Column
 
-Column ids are sequential increasing integers and are common to all Frames within an Index. A single column often corresponds to a record in a relational table, although other configurations are possible, and sometimes preferable.
+Column ids are sequential increasing integers and are common to all Fields within an Index. A single column often corresponds to a record in a relational table, although other configurations are possible, and sometimes preferable.
 
 ### Row
 
-Row ids are sequential increasing integers namespaced to each Frame within an Index.
+Row ids are sequential increasing integers namespaced to each Field within an Index.
 
-### Frame
+### Field
 
-Frames are used to segment rows within an index, for example to define different functional groups. A frame might correspond to a single field in a relational table, where each row in a standard frame represents a single possible value of the field. Similarly, a frame with BSI values could represent all possible integer values of a field .
+Fields are used to segment rows within an index, for example to define different functional groups. A field might correspond to a single field in a relational table, where each row in a standard field represents a single possible value of the field. Similarly, an integer field could represent all possible integer values of a field .
 
 #### Relational Analogy
 
@@ -56,7 +56,7 @@ Entities:
  Database    | N/A *(internal: Holder)*
  Table       | Index
  Row         | Column
- Column      | Frame
+ Column      | Field
  Value       | Row
  Value (int) | Field.Value (see [BSI](#bsi-range-encoding))
 

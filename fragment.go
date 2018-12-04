@@ -959,6 +959,27 @@ func (f *fragment) rangeOp(op pql.Token, bitDepth uint, predicate uint64) (*Row,
 	}
 }
 
+// TODO: maybe it doesn't make sense to call these float
+// when they are really just ints shifted in a wider range
+// floatRangeOp returns bitmaps with a bsiGroup value encoding matching the float predicate.
+func (f *fragment) floatRangeOp(op pql.Token, shiftDepth uint, value uint64, negative bool) (*Row, error) {
+	switch op {
+	case pql.EQ:
+		return f.floatRangeEQ(shiftDepth, value, negative)
+	case pql.NEQ:
+		return f.floatRangeNEQ(shiftDepth, value, negative)
+	// NEXT
+	/*
+		case pql.LT, pql.LTE:
+			return f.floatRangeLT(shiftDepth, value, negative, op == pql.LTE)
+		case pql.GT, pql.GTE:
+			return f.rangeGT(bitDepth, predicate, op == pql.GTE)
+	*/
+	default:
+		return nil, ErrInvalidRangeOperation
+	}
+}
+
 func (f *fragment) rangeEQ(bitDepth uint, predicate uint64) (*Row, error) {
 	// Start with set of columns with values set.
 	b := f.row(uint64(bitDepth))
@@ -978,12 +999,75 @@ func (f *fragment) rangeEQ(bitDepth uint, predicate uint64) (*Row, error) {
 	return b, nil
 }
 
+// TODO: we need a special case for 0 because that would
+// match columns with bits set outside the 156 bit range. Worst
+// case we would have to check all 2100 rows are 0 (and ignore negative bit).
+func (f *fragment) floatRangeEQ(shiftDepth uint, value uint64, negative bool) (*Row, error) {
+	// Start with set of columns with values set.
+	b := f.row(uint64(floatBitDepth))
+
+	// Determine loop range required to loop over
+	// -52,52,+52 (156 rows) around the value.
+	var start, end uint
+	if shiftDepth < 52 {
+		start = 0
+		end = shiftDepth + (2 * 52)
+	} else if shiftDepth > floatBitDepth-(2*52) {
+		start = shiftDepth - 52
+		end = floatBitDepth - 1
+	} else {
+		start = shiftDepth - 52
+		end = shiftDepth + (2 * 52)
+	}
+
+	// Filter any bits that don't match the current bit value.
+	for i := start; i <= end; i++ {
+		row := f.row(uint64(i))
+		bit := uint64(0)
+		if i >= shiftDepth && i < shiftDepth+52 {
+			bit = (value >> i) & 1
+		}
+
+		if bit == 1 {
+			b = b.Intersect(row)
+		} else {
+			b = b.Difference(row)
+		}
+	}
+
+	// Check the negative bit.
+	row := f.row(uint64(floatBitDepth + 1))
+	if negative {
+		b = b.Intersect(row)
+	} else {
+		b = b.Difference(row)
+	}
+
+	return b, nil
+}
+
 func (f *fragment) rangeNEQ(bitDepth uint, predicate uint64) (*Row, error) {
 	// Start with set of columns with values set.
 	b := f.row(uint64(bitDepth))
 
 	// Get the equal bitmap.
 	eq, err := f.rangeEQ(bitDepth, predicate)
+	if err != nil {
+		return nil, err
+	}
+
+	// Not-null minus the equal bitmap.
+	b = b.Difference(eq)
+
+	return b, nil
+}
+
+func (f *fragment) floatRangeNEQ(shiftDepth uint, value uint64, negative bool) (*Row, error) {
+	// Start with set of columns with values set.
+	b := f.row(uint64(floatBitDepth))
+
+	// Get the equal bitmap.
+	eq, err := f.floatRangeEQ(shiftDepth, value, negative)
 	if err != nil {
 		return nil, err
 	}
@@ -1041,6 +1125,60 @@ func (f *fragment) rangeLT(bitDepth uint, predicate uint64, allowEquality bool) 
 
 	return b, nil
 }
+
+/*
+func (f *fragment) floatRangeLT(shiftDepth uint, value uint64, negative bool, allowEquality bool) (*Row, error) {
+	keep := NewRow()
+
+	// Start with set of columns with values set.
+	b := f.row(uint64(floatBitDepth))
+
+	// if negative, find all negative values with sig GT value
+	// if positive, find all positive values with sig LT value + all negative values
+	// if 0, all negative values
+
+	// Filter any bits that don't match the current bit value.
+	leadingZeros := true
+	for i := int(bitDepth - 1); i >= 0; i-- {
+		row := f.row(uint64(i))
+		bit := (predicate >> uint(i)) & 1
+
+		// Remove any columns with higher bits set.
+		if leadingZeros {
+			if bit == 0 {
+				b = b.Difference(row)
+				continue
+			} else {
+				leadingZeros = false
+			}
+		}
+
+		// Handle last bit differently.
+		// If bit is zero then return only already kept columns.
+		// If bit is one then remove any one columns.
+		if i == 0 && !allowEquality {
+			if bit == 0 {
+				return keep, nil
+			}
+			return b.Difference(row.Difference(keep)), nil
+		}
+
+		// If bit is zero then remove all set columns not in excluded bitmap.
+		if bit == 0 {
+			b = b.Difference(row.Difference(keep))
+			continue
+		}
+
+		// If bit is set then add columns for set bits to exclude.
+		// Don't bother to compute this on the final iteration.
+		if i > 0 {
+			keep = keep.Union(b.Difference(row))
+		}
+	}
+
+	return b, nil
+}
+*/
 
 func (f *fragment) rangeGT(bitDepth uint, predicate uint64, allowEquality bool) (*Row, error) {
 	b := f.row(uint64(bitDepth))

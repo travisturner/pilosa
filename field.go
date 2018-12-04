@@ -1048,39 +1048,13 @@ func (f *Field) SetFloat(columnID uint64, value float64) (changed bool, err erro
 		return false, errors.Wrap(err, "creating view")
 	}
 
-	// Check for NaN and Infinity.
-	// TODO: use a bitmap to track NaN/infinity instead of returning an error?
-	if math.IsNaN(value) {
-		return false, errors.New("float provided is NaN")
-	} else if math.IsInf(value, 0) {
-		return false, errors.New("float provided is infinity")
-	}
-
 	// Determine base value to store as well as the shift (exponent) value.
-	svalue := strconv.FormatFloat(value, 'b', -1, 64)
-	parts := strings.Split(svalue, "p")
-
-	var negative bool
-
-	ssig := parts[0]
-	if ssig[:1] == "-" {
-		negative = true
-		ssig = ssig[1:]
-	}
-
-	sig, err := strconv.ParseInt(ssig, 10, 64)
+	plt, err := newPloat64(value)
 	if err != nil {
-		return false, errors.Wrap(err, "getting significand")
-	}
-	exp, err := strconv.ParseInt(parts[1], 10, 64)
-	if err != nil {
-		return false, errors.Wrap(err, "getting exponent")
+		return false, errors.Wrap(err, "getting ploat64")
 	}
 
-	baseValue := uint64(sig)
-	shiftDepth := uint(1076 + exp)
-
-	return view.setFloat(columnID, shiftDepth, baseValue, negative)
+	return view.setFloat(columnID, plt.shift, plt.sig, plt.neg)
 }
 
 // Sum returns the sum and count for a field.
@@ -1475,6 +1449,9 @@ type bsiGroup struct {
 
 // BitDepth returns the number of bits required to store a value between min & max.
 func (b *bsiGroup) BitDepth() uint {
+	if b.Type == bsiGroupTypeFloat {
+		return floatBitDepth
+	}
 	for i := uint(0); i < 63; i++ {
 		if b.Max-b.Min < (1 << i) {
 			return i
@@ -1563,4 +1540,55 @@ func isValidCacheType(v string) bool {
 	default:
 		return false
 	}
+}
+
+// ploat64 is a custom representation of a float64.
+// the primary difference is that a opposed to an exponent,
+// ploat64 has a shift value which represents the positioning
+// of the significant's 52 bits within the 2100 bit depth.
+type ploat64 struct {
+	sig   uint64
+	shift uint
+	neg   bool
+}
+
+// newPloat64 returns a ploat64 based on the given float64.
+func newPloat64(flt float64) (*ploat64, error) {
+	// Check for NaN and Infinity.
+	// TODO: use a bitmap to track NaN/infinity instead of returning an error?
+	if math.IsNaN(flt) {
+		return nil, errors.New("float provided is NaN")
+	} else if math.IsInf(flt, 0) {
+		return nil, errors.New("float provided is infinity")
+	}
+
+	// Determine base value to store as well as the shift (exponent) value.
+	svalue := strconv.FormatFloat(flt, 'b', -1, 64)
+	parts := strings.Split(svalue, "p")
+
+	var negative bool
+
+	ssig := parts[0]
+	if ssig[:1] == "-" {
+		negative = true
+		ssig = ssig[1:]
+	}
+
+	sig, err := strconv.ParseInt(ssig, 10, 64)
+	if err != nil {
+		return nil, errors.Wrap(err, "getting significand")
+	}
+	exp, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		return nil, errors.Wrap(err, "getting exponent")
+	}
+
+	// TODO: use math.Float64bits() and bit shifting instead of strconf
+	// binary := math.Float64bits(flt)
+
+	return &ploat64{
+		sig:   uint64(sig),
+		shift: uint(1076 + exp),
+		neg:   negative,
+	}, nil
 }

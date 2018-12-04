@@ -16,8 +16,10 @@ package pilosa
 
 import (
 	"io/ioutil"
+	"math"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -401,4 +403,87 @@ func TestField_PersistAvailableShardsFootprint(t *testing.T) {
 		t.Fatalf("unexpected available shards (reopen). expected: %v, but got: %v", bm.Slice(), f.remoteAvailableShards.Slice())
 	}
 
+}
+
+// Ensure that ploat64 values are generated correctly.
+func TestField_Ploat64(t *testing.T) {
+	tests := []struct {
+		flt   float64
+		sig   uint64
+		shift uint
+		neg   bool
+		err   string
+	}{
+		{7.0e+0, 7881299347898368, 1026, false, ""},
+		{-1.12e+308, 5611671408025124, 2047, true, ""},
+		{1.12e-292, 5033540777614485, 54, false, ""},
+		{flt: math.NaN(), err: "float provided is NaN"},
+		{flt: math.Inf(0), err: "float provided is infinity"},
+
+		// The following came from ftoa.go tests: https://gist.github.com/rsc/1057873
+		{math.Ldexp(5201988407066741, -824), 5201988407066741, 252, false, ""},
+		{math.Ldexp(6406892948269899, 237), 6406892948269899, 1313, false, ""},
+		{math.Ldexp(8431154198732492, 72), 8431154198732492, 1148, false, ""},
+		{math.Ldexp(6475049196144587, 99), 6475049196144587, 1175, false, ""},
+		{math.Ldexp(8274307542972842, 726), 8274307542972842, 1802, false, ""},
+		{math.Ldexp(5381065484265332, -456), 5381065484265332, 620, false, ""},
+		{math.Ldexp(6761728585499734, -1057), 6761728585499734, 19, false, ""},
+		{math.Ldexp(7976538478610756, 376), 7976538478610756, 1452, false, ""},
+		{math.Ldexp(5982403858958067, 377), 5982403858958067, 1453, false, ""},
+		{math.Ldexp(5536995190630837, 93), 5536995190630837, 1169, false, ""},
+		{math.Ldexp(7225450889282194, 710), 7225450889282194, 1786, false, ""},
+		{math.Ldexp(7225450889282194, 709), 7225450889282194, 1785, false, ""},
+		{math.Ldexp(8703372741147379, 117), 8703372741147379, 1193, false, ""},
+		{math.Ldexp(8944262675275217, -1001), 8944262675275217, 75, false, ""},
+		{math.Ldexp(7459803696087692, -707), 7459803696087692, 369, false, ""},
+		{math.Ldexp(6080469016670379, -381), 6080469016670379, 695, false, ""},
+		{math.Ldexp(8385515147034757, 721), 8385515147034757, 1797, false, ""},
+		{math.Ldexp(7514216811389786, -828), 7514216811389786, 248, false, ""},
+		{math.Ldexp(8397297803260511, -345), 8397297803260511, 731, false, ""},
+		{math.Ldexp(6733459239310543, 202), 6733459239310543, 1278, false, ""},
+		{math.Ldexp(8091450587292794, -473), 8091450587292794, 603, false, ""},
+		{math.Ldexp(6567258882077402, 952), 6567258882077402, 2028, false, ""},
+		{math.Ldexp(6712731423444934, 535), 6712731423444934, 1611, false, ""},
+		{math.Ldexp(6712731423444934, 534), 6712731423444934, 1610, false, ""},
+		{math.Ldexp(5298405411573037, -957), 5298405411573037, 119, false, ""},
+		{math.Ldexp(5137311167659507, -144), 5137311167659507, 932, false, ""},
+		{math.Ldexp(6722280709661868, 363), 6722280709661868, 1439, false, ""},
+		{math.Ldexp(5344436398034927, -169), 5344436398034927, 907, false, ""},
+		{math.Ldexp(8369123604277281, -853), 8369123604277281, 223, false, ""},
+		{math.Ldexp(8995822108487663, -780), 8995822108487663, 296, false, ""},
+		{math.Ldexp(8942832835564782, -383), 8942832835564782, 693, false, ""},
+		{math.Ldexp(8942832835564782, -384), 8942832835564782, 692, false, ""},
+		{math.Ldexp(8942832835564782, -385), 8942832835564782, 691, false, ""},
+		{math.Ldexp(6965949469487146, -249), 6965949469487146, 827, false, ""},
+		{math.Ldexp(6965949469487146, -250), 6965949469487146, 826, false, ""},
+		{math.Ldexp(6965949469487146, -251), 6965949469487146, 825, false, ""},
+		{math.Ldexp(7487252720986826, 548), 7487252720986826, 1624, false, ""},
+		{math.Ldexp(5592117679628511, 164), 5592117679628511, 1240, false, ""},
+		{math.Ldexp(8887055249355788, 665), 8887055249355788, 1741, false, ""},
+		{math.Ldexp(6994187472632449, 690), 6994187472632449, 1766, false, ""},
+		{math.Ldexp(8797576579012143, 588), 8797576579012143, 1664, false, ""},
+		{math.Ldexp(7363326733505337, 272), 7363326733505337, 1348, false, ""},
+		{math.Ldexp(8549497411294502, -448), 8549497411294502, 628, false, ""},
+
+		{12345000, 6627671408640000, 1047, false, ""},
+	}
+	for i, test := range tests {
+		// Generate ploat64 based on float64.
+		plt, err := newPloat64(test.flt)
+		if test.err != "" {
+			if !strings.Contains(err.Error(), test.err) {
+				t.Errorf("test %d expected error: %s, but got: %s", i, test.err, err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		} else if plt.sig != test.sig {
+			t.Errorf("test %d expected sig: %v, but got: %v", i, test.sig, plt.sig)
+		} else if plt.shift != test.shift {
+			t.Errorf("test %d expected shift: %v, but got: %v", i, test.shift, plt.shift)
+		} else if plt.neg != test.neg {
+			t.Errorf("test %d expected neg: %v, but got: %v", i, test.neg, plt.neg)
+		}
+	}
 }

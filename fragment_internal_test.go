@@ -490,6 +490,74 @@ func TestFragment_MinMax(t *testing.T) {
 }
 
 // Ensure a fragment query for matching values.
+func TestFragment_FloatRange(t *testing.T) {
+	const bitDepth = 16
+
+	t.Run("EQ", func(t *testing.T) {
+		f := mustOpenFragment("i", "f", viewStandard, 0, "")
+		defer f.Close()
+
+		// Set values.
+		if _, err := f.setFloat(1000, 0, 7, false); err != nil {
+			t.Fatal(err)
+		} else if _, err := f.setFloat(2000, 0, 7, true); err != nil {
+			t.Fatal(err)
+		} else if _, err := f.setFloat(3000, 1000, 87, true); err != nil {
+			t.Fatal(err)
+		}
+
+		// Query for equality.
+		if b, err := f.floatRangeOp(pql.EQ, 0, 7, false); err != nil {
+			t.Fatal(err)
+		} else if !reflect.DeepEqual(b.Columns(), []uint64{1000}) {
+			t.Fatalf("unexpected columns: %+v", b.Columns())
+		}
+	})
+
+	t.Run("NEQ", func(t *testing.T) {
+		f := mustOpenFragment("i", "f", viewStandard, 0, "")
+		defer f.Close()
+
+		// Set values.
+		if _, err := f.setFloat(1000, 0, 7, false); err != nil {
+			t.Fatal(err)
+		} else if _, err := f.setFloat(2000, 0, 7, true); err != nil {
+			t.Fatal(err)
+		} else if _, err := f.setFloat(3000, 1000, 87, true); err != nil {
+			t.Fatal(err)
+		}
+
+		// Query for equality.
+		if b, err := f.floatRangeOp(pql.NEQ, 0, 7, false); err != nil {
+			t.Fatal(err)
+		} else if !reflect.DeepEqual(b.Columns(), []uint64{2000, 3000}) {
+			t.Fatalf("unexpected columns: %+v", b.Columns())
+		}
+	})
+
+	t.Run("LT", func(t *testing.T) {
+		f := mustOpenFragment("i", "f", viewStandard, 0, "")
+		defer f.Close()
+
+		// Set values.
+		if _, err := f.setFloat(1000, 0, 7, false); err != nil {
+			t.Fatal(err)
+		} else if _, err := f.setFloat(2000, 0, 7, true); err != nil {
+			t.Fatal(err)
+		} else if _, err := f.setFloat(3000, 1000, 87, true); err != nil {
+			t.Fatal(err)
+		}
+
+		// Query for equality.
+		if b, err := f.floatRangeOp(pql.LT, 0, 8, false); err != nil {
+			t.Fatal(err)
+		} else if !reflect.DeepEqual(b.Columns(), []uint64{1000, 2000}) {
+			t.Fatalf("unexpected columns: %+v", b.Columns())
+		}
+	})
+}
+
+// Ensure a fragment query for matching values.
 func TestFragment_Range(t *testing.T) {
 	const bitDepth = 16
 

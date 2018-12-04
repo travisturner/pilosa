@@ -428,7 +428,7 @@ func (cond *Condition) String() string {
 	return fmt.Sprintf("%s %s", cond.Op.String(), formatValue(cond.Value))
 }
 
-// IntSliceValue reads cond.Value as a slice of uint64.
+// IntSliceValue reads cond.Value as a slice of int64.
 // If the value is a slice of uint64 it will convert
 // it to []int64. Otherwise, if it is not a []int64 it will return an error.
 func (cond *Condition) IntSliceValue() ([]int64, error) {

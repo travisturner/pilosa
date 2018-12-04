@@ -1326,6 +1326,8 @@ func (e *executor) executeBSIGroupRangeShard(ctx context.Context, index string, 
 
 	} else if cond.Op == pql.BETWEEN {
 
+		// TODO: need to implement BETWEEN for float fields
+
 		predicates, err := cond.IntSliceValue()
 		if err != nil {
 			return nil, errors.Wrap(err, "getting condition value")
@@ -1367,29 +1369,52 @@ func (e *executor) executeBSIGroupRangeShard(ctx context.Context, index string, 
 
 	} else {
 
-		// Only support integers for now.
-		value, ok := cond.Value.(int64)
-		if !ok {
-			return nil, errors.New("Range(): conditions only support integer values")
+		// Handle the range value based on field type.
+		switch f.Type() {
+		case FieldTypeInt:
+			return e.executeBSIGroupRangeIntShard(ctx, f, cond, shard)
+		case FieldTypeFloat:
+			return e.executeBSIGroupRangeFloatShard(ctx, f, cond, shard)
+		default:
+			return nil, errors.New("Range(): conditions only support integer and float values")
 		}
+	}
+}
 
-		// Find bsiGroup.
-		bsig := f.bsiGroup(fieldName)
-		if bsig == nil {
-			return nil, ErrBSIGroupNotFound
-		}
+// executeBSIGroupRangeFloatShard executes a range(bsiGroup) call on a float field for a local shard.
+func (e *executor) executeBSIGroupRangeFloatShard(_ context.Context, field *Field, cond *pql.Condition, shard uint64) (*Row, error) {
+	// Ensure conditional value is a float.
+	value, ok := cond.Value.(float64)
+	if !ok {
+		return nil, errors.New("float fields require float conditional values")
+	}
 
+	// Find bsiGroup.
+	bsig := field.bsiGroup(field.Name())
+	if bsig == nil {
+		return nil, ErrBSIGroupNotFound
+	}
+
+	plt, err := newPloat64(value)
+	if err != nil {
+		return nil, errors.Wrap(err, "getting ploat64")
+	}
+	_ = plt
+
+	/*
 		baseValue, outOfRange := bsig.baseValue(cond.Op, value)
 		if outOfRange && cond.Op != pql.NEQ {
 			return NewRow(), nil
 		}
+	*/
 
-		// Retrieve fragment.
-		frag := e.Holder.fragment(index, fieldName, viewBSIGroupPrefix+fieldName, shard)
-		if frag == nil {
-			return NewRow(), nil
-		}
+	// Retrieve fragment.
+	frag := e.Holder.fragment(field.Index(), field.Name(), viewBSIGroupPrefix+field.Name(), shard)
+	if frag == nil {
+		return NewRow(), nil
+	}
 
+	/*
 		// LT[E] and GT[E] should return all not-null if selected range fully encompasses valid bsiGroup range.
 		if (cond.Op == pql.LT && value > bsig.Max) || (cond.Op == pql.LTE && value >= bsig.Max) ||
 			(cond.Op == pql.GT && value < bsig.Min) || (cond.Op == pql.GTE && value <= bsig.Min) {
@@ -1401,9 +1426,50 @@ func (e *executor) executeBSIGroupRangeShard(ctx context.Context, index string, 
 			return frag.notNull(bsig.BitDepth())
 		}
 
-		f.Stats.Count("range:bsigroup", 1, 1.0)
-		return frag.rangeOp(cond.Op, bsig.BitDepth(), baseValue)
+		field.Stats.Count("range:bsigroup", 1, 1.0)
+	*/
+	//return frag.rangeOp(cond.Op, bsig.BitDepth(), baseValue)
+	return nil, nil
+}
+
+// executeBSIGroupRangeIntShard executes a range(bsiGroup) call on an int field for a local shard.
+func (e *executor) executeBSIGroupRangeIntShard(_ context.Context, field *Field, cond *pql.Condition, shard uint64) (*Row, error) {
+	// Ensure conditional value is an integer.
+	value, ok := cond.Value.(int64)
+	if !ok {
+		return nil, errors.New("int fields require integer conditional values")
 	}
+
+	// Find bsiGroup.
+	bsig := field.bsiGroup(field.Name())
+	if bsig == nil {
+		return nil, ErrBSIGroupNotFound
+	}
+
+	baseValue, outOfRange := bsig.baseValue(cond.Op, value)
+	if outOfRange && cond.Op != pql.NEQ {
+		return NewRow(), nil
+	}
+
+	// Retrieve fragment.
+	frag := e.Holder.fragment(field.Index(), field.Name(), viewBSIGroupPrefix+field.Name(), shard)
+	if frag == nil {
+		return NewRow(), nil
+	}
+
+	// LT[E] and GT[E] should return all not-null if selected range fully encompasses valid bsiGroup range.
+	if (cond.Op == pql.LT && value > bsig.Max) || (cond.Op == pql.LTE && value >= bsig.Max) ||
+		(cond.Op == pql.GT && value < bsig.Min) || (cond.Op == pql.GTE && value <= bsig.Min) {
+		return frag.notNull(bsig.BitDepth())
+	}
+
+	// outOfRange for NEQ should return all not-null.
+	if outOfRange && cond.Op == pql.NEQ {
+		return frag.notNull(bsig.BitDepth())
+	}
+
+	field.Stats.Count("range:bsigroup", 1, 1.0)
+	return frag.rangeOp(cond.Op, bsig.BitDepth(), baseValue)
 }
 
 // executeUnionShard executes a union() call for a local shard.

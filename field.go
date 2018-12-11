@@ -635,8 +635,8 @@ func (f *Field) addBSIGroup(bsig *bsiGroup) error {
 
 // TimeQuantum returns the time quantum for the field.
 func (f *Field) TimeQuantum() TimeQuantum {
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	return f.options.TimeQuantum
 }
 

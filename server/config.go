@@ -15,10 +15,17 @@
 package server
 
 import (
+	"context"
+	"fmt"
+	"log"
+	"net"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/pilosa/pilosa/gossip"
 	"github.com/pilosa/pilosa/toml"
+	"github.com/pkg/errors"
 	"github.com/uber/jaeger-client-go"
 )
 
@@ -37,8 +44,17 @@ type Config struct {
 	// DataDir is the directory where Pilosa stores both indexed data and
 	// running state such as cluster topology information.
 	DataDir string `toml:"data-dir"`
+
 	// Bind is the host:port on which Pilosa will listen.
-	Bind string `toml:"bind"`
+	Bind string `toml:"bind"` // TODO (2.0): Remove this as it has been deprecated.
+
+	// ListenAddr is the address the server is listening on.
+	ListenAddr string `toml:"listen-addr"`
+
+	// AdvertiseAddr is the address advertised by the server to other nodes
+	// in the cluster. It should be reachable by all other nodes and should
+	// route to an interface that Addr is listening on.
+	AdvertiseAddr string `toml:"advertise-addr"`
 
 	// MaxWritesPerRequest limits the number of mutating commands that can be in
 	// a single request to the server. This includes Set, Clear,
@@ -107,8 +123,9 @@ type Config struct {
 // NewConfig returns an instance of Config with default options.
 func NewConfig() *Config {
 	c := &Config{
-		DataDir:             "~/.pilosa",
-		Bind:                ":10101",
+		DataDir:    "~/.pilosa",
+		ListenAddr: ":10101",
+		// AdvertiseAddr: "",
 		MaxWritesPerRequest: 5000,
 		// LogPath: "",
 		// Verbose: false,
@@ -149,4 +166,208 @@ func NewConfig() *Config {
 	c.Tracing.SamplerParam = 0.001
 
 	return c
+}
+
+// TODO: update the following to be pilosa-specific
+
+// ValidateAddrs controls the address fields in the Config object
+// and "fills in" the blanks:
+// - the host part of Addr and HTTPAddr is resolved to an IP address
+//   if specified (it stays blank if blank to mean "all addresses").
+// - the host part of AdvertiseAddr is filled in if blank, either
+//   from Addr if non-empty or os.Hostname(). It is also checked
+//   for resolvability.
+// - non-numeric port numbers are resolved to numeric.
+//
+// The addresses fields must be guaranteed by the caller to either be
+// completely empty, or have both a host part and a port part
+// separated by a colon. In the latter case either can be empty to
+// indicate it's left unspecified.
+func (cfg *Config) ValidateAddrs(ctx context.Context) error {
+	// TODO (2.0): Deprecate Bind.
+	if cfg.Bind != "" {
+		cfg.ListenAddr = cfg.Bind
+	}
+
+	// Validate the advertise address.
+	advScheme, advHost, advPort, err := validateAdvertiseAddr(ctx, cfg.AdvertiseAddr, cfg.ListenAddr)
+	if err != nil {
+		return errors.Wrapf(err, "validating advertise address")
+	}
+	cfg.AdvertiseAddr = schemeHostPortString(advScheme, advHost, advPort)
+
+	// Validate the listen address.
+	listenScheme, listenHost, listenPort, err := validateListenAddr(ctx, cfg.ListenAddr)
+	if err != nil {
+		return errors.Wrap(err, "validating listen address")
+	}
+	cfg.ListenAddr = schemeHostPortString(listenScheme, listenHost, listenPort)
+
+	return nil
+}
+
+// validateAdvertiseAddr validates and normalizes an address suitable
+// for use in gossiping - for use by other nodes. This ensures
+// that if the "host" part is empty, it gets filled in with
+// the configured listen address if any, or the canonical host name.
+// Returns scheme, host, port as strings.
+func validateAdvertiseAddr(ctx context.Context, advAddr, listenAddr string) (string, string, string, error) {
+	listenScheme, listenHost, listenPort, err := getListenAddr(listenAddr)
+	if err != nil {
+		return "", "", "", errors.Wrap(err, "getting listen address")
+	}
+
+	advScheme, advHostPort := getScheme(advAddr)
+	advHost, advPort := "", ""
+	if advHostPort != "" {
+		var err error
+		advHost, advPort, err = net.SplitHostPort(advHostPort)
+		if err != nil {
+			return "", "", "", err
+		}
+	}
+	// If no advertise scheme was specified, use the one from
+	// the listen address.
+	if advScheme == "" {
+		advScheme = listenScheme
+	}
+	// If there was no port number, reuse the one from the listen
+	// address.
+	if advPort == "" || advPort == "0" {
+		advPort = listenPort
+	}
+	// Resolve non-numeric to numeric.
+	portNumber, err := net.DefaultResolver.LookupPort(ctx, "tcp", advPort)
+	if err != nil {
+		return "", "", "", err
+	}
+	advPort = strconv.Itoa(portNumber)
+
+	// If the advertise host is empty, then we have two cases.
+	if advHost == "" {
+		if listenHost == "0.0.0.0" {
+			advHost = getOutboundIP().String()
+		} else {
+			advHost = listenHost
+		}
+	}
+	return advScheme, advHost, advPort, nil
+}
+
+// Get preferred outbound ip of this machine
+func getOutboundIP() net.IP {
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer conn.Close()
+
+	localAddr := conn.LocalAddr().(*net.UDPAddr)
+
+	return localAddr.IP
+}
+
+// validateListenAddr validates and normalizes an address suitable for
+// use with net.Listen(). This accepts an empty "host" part as "listen
+// on all interfaces" and resolves host names to IP addresses.
+// Returns scheme, host, port as strings.
+func validateListenAddr(ctx context.Context, addr string) (string, string, string, error) {
+	scheme, host, port, err := getListenAddr(addr)
+	if err != nil {
+		return "", "", "", errors.Wrap(err, "getting listen address")
+	}
+	rHost, rPort, err := resolveAddr(ctx, host, port)
+	if err != nil {
+		return "", "", "", errors.Wrap(err, "resolving address")
+	}
+	return scheme, rHost, rPort, nil
+}
+
+// getScheme returns two strings: the scheme and the hostPort.
+func getScheme(addr string) (string, string) {
+	parts := strings.SplitN(addr, "://", 2)
+	if len(parts) == 1 {
+		return "", addr
+	}
+	return parts[0], parts[1]
+}
+
+func schemeHostPortString(scheme, host, port string) string {
+	var addr string
+	if scheme != "" {
+		addr += fmt.Sprintf("%s://", scheme)
+	}
+	addr += net.JoinHostPort(host, port)
+	return addr
+}
+
+// getListenAddr returns scheme, host, port as strings.
+func getListenAddr(addr string) (string, string, string, error) {
+	scheme, hostPort := getScheme(addr)
+	host, port := "", ""
+	if hostPort != "" {
+		var err error
+		host, port, err = net.SplitHostPort(hostPort)
+		if err != nil {
+			return "", "", "", err
+		}
+	}
+	if port == "" {
+		port = "10101"
+	}
+	return scheme, host, port, nil
+}
+
+// resolveAddr resolves non-numeric references to numeric references.
+func resolveAddr(ctx context.Context, host, port string) (string, string, error) {
+	resolver := net.DefaultResolver
+
+	// Resolve the port number. This may translate service names
+	// e.g. "postgresql" to a numeric value.
+	portNumber, err := resolver.LookupPort(ctx, "tcp", port)
+	if err != nil {
+		return "", "", errors.Wrap(err, "looking up port")
+	}
+	port = strconv.Itoa(portNumber)
+
+	// Resolve the address.
+	if host == "" {
+		// Keep empty. This means "listen on all addresses".
+		return host, port, nil
+	}
+
+	addr, err := LookupAddr(ctx, resolver, host)
+	if err != nil {
+		return "", "", errors.Wrap(err, "looking up address")
+	}
+	return addr, port, nil
+}
+
+// LookupAddr resolves the given address/host to an IP address. If
+// multiple addresses are resolved, it returns the first IPv4 address
+// available if there is one, otherwise the first address.
+func LookupAddr(ctx context.Context, resolver *net.Resolver, host string) (string, error) {
+	// Resolve the IP address or hostname to an IP address.
+	addrs, err := resolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return "", errors.Wrap(err, "looking up IP addresses")
+	}
+	if len(addrs) == 0 {
+		return "", fmt.Errorf("cannot resolve %q to an address", host)
+	}
+
+	// TODO(knz): the remainder function can be changed to return all
+	// resolved addresses once the server is taught to listen on
+	// multiple interfaces. #5816
+
+	// LookupIPAddr() can return a mix of IPv6 and IPv4
+	// addresses. Return the first IPv4 address if possible.
+	for _, addr := range addrs {
+		if ip := addr.IP.To4(); ip != nil {
+			return ip.String(), nil
+		}
+	}
+
+	// No IPv4 address, return the first resolved address instead.
+	return addrs[0].String(), nil
 }

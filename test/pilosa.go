@@ -69,7 +69,8 @@ func newCommand(opts ...server.CommandOption) *Command {
 	m := &Command{commandOptions: opts}
 	m.Command = server.NewCommand(bytes.NewReader(nil), ioutil.Discard, ioutil.Discard, opts...)
 	m.Config.DataDir = path
-	m.Config.Bind = "http://localhost:0"
+	//m.Config.Bind = "http://localhost:0"
+	m.Config.ListenAddr = "http://localhost:0"
 	m.Config.Cluster.Disabled = true
 	m.Config.Translation.MapSize = 140000
 

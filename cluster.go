@@ -118,7 +118,7 @@ func (a Nodes) FilterID(id string) []*Node {
 	return other
 }
 
-// FilterURI returns a new list of nodes with URI removed.
+// FilterURI returns a new list of nodes with uri removed.
 func (a Nodes) FilterURI(uri URI) []*Node {
 	other := make([]*Node, 0, len(a))
 	for _, node := range a {
@@ -609,6 +609,7 @@ func (c *cluster) addNodeBasicSorted(node *Node) bool {
 // Nodes returns a copy of the slice of nodes in the cluster. Safe for
 // concurrent use, result may be modified.
 func (c *cluster) Nodes() []*Node {
+	// TODO: can this be a read lock?
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	ret := make([]*Node, len(c.nodes))
@@ -1081,7 +1082,6 @@ func (c *cluster) unprotectedSetStateAndBroadcast(state string) error {
 	// Broadcast cluster status changes to the cluster.
 	status := c.unprotectedStatus()
 	return c.broadcaster.SendSync(status) // TODO fix c.Status
-
 }
 
 func (c *cluster) sendTo(node *Node, m Message) error {
